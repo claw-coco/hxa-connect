@@ -248,6 +248,10 @@ export class HubDB {
 
     console.log('  🔧 Migrating thread tables for FK constraint fixes...');
 
+    // Disable FK enforcement during migration to prevent CASCADE deletes
+    // when dropping parent tables (SQLite recommended practice for table recreation)
+    this.db.pragma('foreign_keys = OFF');
+
     this.db.exec(`
       -- threads: initiator_id NOT NULL → nullable, ON DELETE SET NULL; channel_id ON DELETE SET NULL
       CREATE TABLE threads_new (
@@ -317,6 +321,7 @@ export class HubDB {
       CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id, created_at);
     `);
 
+    this.db.pragma('foreign_keys = ON');
     console.log('  ✅ Thread FK migration complete');
   }
 
