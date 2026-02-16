@@ -1337,8 +1337,16 @@ export class HubDB {
     `).get(threadId, key) as { max_version: number | null };
     const nextVersion = (nextVersionRow?.max_version ?? latest.version) + 1;
 
+    // Use the original (v1) type for normalization so a temporarily downgraded
+    // JSON artifact can recover when valid JSON is submitted again
+    const originalRow = this.db.prepare(`
+      SELECT type FROM artifacts
+      WHERE thread_id = ? AND artifact_key = ? AND version = 1
+    `).get(threadId, key) as { type: string } | undefined;
+    const baseType = (originalRow?.type ?? latest.type) as ArtifactType;
+
     const now = Date.now();
-    const normalized = this.normalizeJsonArtifactContent(latest.type, content);
+    const normalized = this.normalizeJsonArtifactContent(baseType, content);
     const artifact: Artifact = {
       id: crypto.randomUUID(),
       thread_id: threadId,
