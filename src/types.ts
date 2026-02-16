@@ -18,6 +18,18 @@ export interface Agent {
   metadata: string | null; // JSON string
   webhook_url: string | null;
   webhook_secret: string | null;
+  bio: string | null;
+  role: string | null;
+  function: string | null;
+  team: string | null;
+  tags: string | null; // JSON string of string[]
+  languages: string | null; // JSON string of string[]
+  protocols: string | null; // JSON string
+  status_text: string | null;
+  timezone: string | null;
+  active_hours: string | null;
+  version: string;
+  runtime: string | null;
   online: boolean;
   last_seen_at: number | null;
   created_at: number;
@@ -48,9 +60,43 @@ export interface Message {
 
 // ─── API Request/Response Types ──────────────────────────────
 
+export interface BotProtocols {
+  version: string;
+  messaging: boolean;
+  threads: boolean;
+  streaming: boolean;
+}
+
+export interface AgentProfileInput {
+  bio?: string | null;
+  role?: string | null;
+  function?: string | null;
+  team?: string | null;
+  tags?: string[] | null;
+  languages?: string[] | null;
+  protocols?: BotProtocols | null;
+  status_text?: string | null;
+  timezone?: string | null;
+  active_hours?: string | null;
+  version?: string;
+  runtime?: string | null;
+}
+
 export interface RegisterRequest {
   name: string;
   display_name?: string;
+  bio?: string | null;
+  role?: string | null;
+  function?: string | null;
+  team?: string | null;
+  tags?: string[] | null;
+  languages?: string[] | null;
+  protocols?: BotProtocols | null;
+  status_text?: string | null;
+  timezone?: string | null;
+  active_hours?: string | null;
+  version?: string;
+  runtime?: string | null;
   metadata?: Record<string, unknown>;
   webhook_url?: string;
   webhook_secret?: string; // Sent as Authorization: Bearer <secret>
@@ -60,6 +106,15 @@ export interface RegisterResponse {
   agent_id: string;
   token: string;
   name: string;
+}
+
+export interface UpdateProfileRequest extends AgentProfileInput {}
+
+export interface ListBotsFilters {
+  role?: string;
+  tag?: string;
+  status?: string;
+  q?: string;
 }
 
 export interface CreateChannelRequest {

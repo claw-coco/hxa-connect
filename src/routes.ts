@@ -2,7 +2,46 @@ import { Router } from 'express';
 import type { HubDB } from './db.js';
 import type { HubWS } from './ws.js';
 import { authMiddleware, requireAgent, requireOrg } from './auth.js';
-import type { HubConfig } from './types.js';
+import type { HubConfig, Agent, AgentProfileInput } from './types.js';
+
+function parseJsonField<T>(value: string | null): T | null {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
+}
+
+function toAgentResponse(agent: Agent) {
+  return {
+    id: agent.id,
+    org_id: agent.org_id,
+    name: agent.name,
+    display_name: agent.display_name,
+    online: agent.online,
+    last_seen_at: agent.last_seen_at,
+    created_at: agent.created_at,
+    metadata: parseJsonField<Record<string, unknown>>(agent.metadata),
+    bio: agent.bio,
+    role: agent.role,
+    function: agent.function,
+    team: agent.team,
+    tags: parseJsonField<string[]>(agent.tags),
+    languages: parseJsonField<string[]>(agent.languages),
+    protocols: parseJsonField<Record<string, unknown>>(agent.protocols),
+    status_text: agent.status_text,
+    timezone: agent.timezone,
+    active_hours: agent.active_hours,
+    version: agent.version,
+    runtime: agent.runtime,
+  };
+}
+
+function getQueryString(value: unknown): string | undefined {
+  if (Array.isArray(value)) return typeof value[0] === 'string' ? value[0] : undefined;
+  return typeof value === 'string' ? value : undefined;
+}
 
 export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
   const router = Router();
@@ -19,6 +58,13 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return false;
     }
     return true;
+  }
+
+  function requireOrgOrAgent(req: import('express').Request, res: import('express').Response): string | undefined {
+    if (req.agent) return req.agent.org_id;
+    if (req.org) return req.org.id;
+    res.status(403).json({ error: 'Authentication required' });
+    return undefined;
   }
 
   /**
@@ -59,7 +105,26 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
    * Returns: { agent_id, token, name }
    */
   auth.post('/api/register', requireOrg, (req, res) => {
-    const { name, display_name, metadata, webhook_url, webhook_secret } = req.body;
+    const {
+      name,
+      display_name,
+      metadata,
+      webhook_url,
+      webhook_secret,
+      bio,
+      role,
+      function: functionName,
+      team,
+      tags,
+      languages,
+      protocols,
+      status_text,
+      timezone,
+      active_hours,
+      version,
+      runtime,
+    } = req.body;
+
     if (!name) {
       res.status(400).json({ error: 'name is required' });
       return;
@@ -70,7 +135,22 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
-    const agent = db.registerAgent(req.org!.id, name, display_name, metadata, webhook_url, webhook_secret);
+    const profile: AgentProfileInput = {
+      bio,
+      role,
+      function: functionName,
+      team,
+      tags,
+      languages,
+      protocols,
+      status_text,
+      timezone,
+      active_hours,
+      version,
+      runtime,
+    };
+
+    const agent = db.registerAgent(req.org!.id, name, display_name, metadata, webhook_url, webhook_secret, profile);
 
     // Broadcast agent online to all org viewers (Web UI etc.)
     ws.broadcastToOrg(req.org!.id, {
@@ -81,7 +161,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     res.json({
       agent_id: agent.id,
       token: agent.token,
-      name: agent.name,
+      ...toAgentResponse(agent),
     });
   });
 
@@ -90,15 +170,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
    */
   auth.get('/api/agents', requireOrg, (req, res) => {
     const agents = db.listAgents(req.org!.id);
-    res.json(agents.map(a => ({
-      id: a.id,
-      name: a.name,
-      display_name: a.display_name,
-      online: a.online,
-      last_seen_at: a.last_seen_at,
-      metadata: a.metadata ? JSON.parse(a.metadata) : null,
-      created_at: a.created_at,
-    })));
+    res.json(agents.map(a => toAgentResponse(a)));
   });
 
   /**
@@ -152,14 +224,56 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
    */
   auth.get('/api/me', requireAgent, (req, res) => {
     const a = req.agent!;
-    res.json({
-      id: a.id,
-      name: a.name,
-      display_name: a.display_name,
-      org_id: a.org_id,
-      online: a.online,
-      metadata: a.metadata ? JSON.parse(a.metadata) : null,
-    });
+    res.json(toAgentResponse(a));
+  });
+
+  /**
+   * PATCH /api/me/profile — Update current bot profile fields
+   */
+  auth.patch('/api/me/profile', requireAgent, (req, res) => {
+    const {
+      bio,
+      role,
+      function: functionName,
+      team,
+      tags,
+      languages,
+      protocols,
+      status_text,
+      timezone,
+      active_hours,
+      version,
+      runtime,
+    } = req.body;
+
+    const fields: AgentProfileInput = {
+      bio,
+      role,
+      function: functionName,
+      team,
+      tags,
+      languages,
+      protocols,
+      status_text,
+      timezone,
+      active_hours,
+      version,
+      runtime,
+    };
+
+    if (Object.values(fields).every(v => v === undefined)) {
+      res.status(400).json({ error: 'No profile fields provided' });
+      return;
+    }
+
+    const updated = db.updateProfile(req.agent!.id, fields);
+    if (!updated) {
+      res.status(404).json({ error: 'Agent not found' });
+      return;
+    }
+
+    req.agent = updated;
+    res.json(toAgentResponse(updated));
   });
 
   /**
@@ -169,14 +283,43 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     const agents = db.listAgents(req.agent!.org_id);
     res.json(agents
       .filter(a => a.id !== req.agent!.id)
-      .map(a => ({
-        id: a.id,
-        name: a.name,
-        display_name: a.display_name,
-        online: a.online,
-        last_seen_at: a.last_seen_at,
-      }))
+      .map(a => toAgentResponse(a))
     );
+  });
+
+  /**
+   * GET /api/bots — Discover bots in org
+   * Query: role?, tag?, status?, q?
+   * Auth: org API key or agent token
+   */
+  auth.get('/api/bots', (req, res) => {
+    const orgId = requireOrgOrAgent(req, res);
+    if (!orgId) return;
+
+    const role = getQueryString(req.query.role);
+    const tag = getQueryString(req.query.tag);
+    const status = getQueryString(req.query.status);
+    const q = getQueryString(req.query.q);
+
+    const bots = db.listBots(orgId, { role, tag, status, q });
+    res.json(bots.map(bot => toAgentResponse(bot)));
+  });
+
+  /**
+   * GET /api/bots/:name/profile — Get full profile by bot name
+   * Auth: org API key or agent token
+   */
+  auth.get('/api/bots/:name/profile', (req, res) => {
+    const orgId = requireOrgOrAgent(req, res);
+    if (!orgId) return;
+
+    const bot = db.getAgentByName(orgId, req.params.name as string);
+    if (!bot) {
+      res.status(404).json({ error: 'Bot not found' });
+      return;
+    }
+
+    res.json(toAgentResponse(bot));
   });
 
   // ─── Channels ─────────────────────────────────────────────
@@ -368,10 +511,9 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
-    const limitStr = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
-    const beforeStr = Array.isArray(req.query.before) ? req.query.before[0] : req.query.before;
-    const limit = Math.min(parseInt(limitStr as string) || 50, 200);
-    const before = beforeStr ? parseInt(beforeStr as string) : undefined;
+    const limit = Math.min(parseInt(getQueryString(req.query.limit) || '') || 50, 200);
+    const beforeStr = getQueryString(req.query.before);
+    const before = beforeStr ? parseInt(beforeStr) : undefined;
 
     const messages = db.getMessages(channel.id, limit, before);
 
@@ -438,8 +580,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
    * Query: since (timestamp, required)
    */
   auth.get('/api/inbox', requireAgent, (req, res) => {
-    const sinceStr = Array.isArray(req.query.since) ? req.query.since[0] : req.query.since;
-    const since = parseInt(sinceStr as string);
+    const since = parseInt(getQueryString(req.query.since) || '');
     if (isNaN(since)) {
       res.status(400).json({ error: 'since (timestamp) is required' });
       return;

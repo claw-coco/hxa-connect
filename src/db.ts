@@ -1,9 +1,8 @@
 import Database from 'better-sqlite3';
-import { v4 as uuid } from 'uuid';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
-import type { Org, Agent, Channel, ChannelMember, Message, HubConfig } from './types.js';
+import type { Org, Agent, Channel, ChannelMember, Message, HubConfig, AgentProfileInput, ListBotsFilters } from './types.js';
 
 // ─── Database Layer ──────────────────────────────────────────
 
@@ -81,6 +80,71 @@ export class HubDB {
     } catch {
       // Column already exists
     }
+
+    // Migration: add profile fields to existing agents
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN bio TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN role TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN function TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN team TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN tags TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN languages TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN protocols TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN status_text TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN timezone TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN active_hours TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN version TEXT DEFAULT '1.0.0'`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE agents ADD COLUMN runtime TEXT`);
+    } catch {
+      // Column already exists
+    }
+
+    this.db.prepare(`UPDATE agents SET version = '1.0.0' WHERE version IS NULL OR version = ''`).run();
+
     // Generate admin_secret for orgs that don't have one
     const orgsWithoutSecret = this.db.prepare('SELECT id FROM orgs WHERE admin_secret IS NULL').all() as any[];
     for (const org of orgsWithoutSecret) {
@@ -90,11 +154,68 @@ export class HubDB {
     }
   }
 
+  private rowToOrg(row: any): Org {
+    return {
+      ...row,
+      persist_messages: !!row.persist_messages,
+    };
+  }
+
+  private rowToAgent(row: any): Agent {
+    return {
+      ...row,
+      bio: row.bio ?? null,
+      role: row.role ?? null,
+      function: row.function ?? null,
+      team: row.team ?? null,
+      tags: row.tags ?? null,
+      languages: row.languages ?? null,
+      protocols: row.protocols ?? null,
+      status_text: row.status_text ?? null,
+      timezone: row.timezone ?? null,
+      active_hours: row.active_hours ?? null,
+      version: row.version ?? '1.0.0',
+      runtime: row.runtime ?? null,
+      online: !!row.online,
+    };
+  }
+
+  private serializeProfileFields(fields?: AgentProfileInput): {
+    bio?: string | null;
+    role?: string | null;
+    function?: string | null;
+    team?: string | null;
+    tags?: string | null;
+    languages?: string | null;
+    protocols?: string | null;
+    status_text?: string | null;
+    timezone?: string | null;
+    active_hours?: string | null;
+    version?: string;
+    runtime?: string | null;
+  } {
+    if (!fields) return {};
+    return {
+      bio: fields.bio,
+      role: fields.role,
+      function: fields.function,
+      team: fields.team,
+      tags: fields.tags === undefined ? undefined : (fields.tags === null ? null : JSON.stringify(fields.tags)),
+      languages: fields.languages === undefined ? undefined : (fields.languages === null ? null : JSON.stringify(fields.languages)),
+      protocols: fields.protocols === undefined ? undefined : (fields.protocols === null ? null : JSON.stringify(fields.protocols)),
+      status_text: fields.status_text,
+      timezone: fields.timezone,
+      active_hours: fields.active_hours,
+      version: fields.version,
+      runtime: fields.runtime,
+    };
+  }
+
   // ─── Org Operations ──────────────────────────────────────
 
   createOrg(name: string, persistMessages = true): Org {
     const org: Org = {
-      id: uuid(),
+      id: crypto.randomUUID(),
       name,
       api_key: crypto.randomBytes(24).toString('hex'),
       admin_secret: crypto.randomBytes(24).toString('hex'),
@@ -110,7 +231,7 @@ export class HubDB {
   getOrgByKey(apiKey: string): Org | undefined {
     const row = this.db.prepare('SELECT * FROM orgs WHERE api_key = ?').get(apiKey) as any;
     if (!row) return undefined;
-    return { ...row, persist_messages: !!row.persist_messages };
+    return this.rowToOrg(row);
   }
 
   verifyOrgAdminSecret(orgId: string, secret: string): boolean {
@@ -121,70 +242,250 @@ export class HubDB {
   getOrgById(id: string): Org | undefined {
     const row = this.db.prepare('SELECT * FROM orgs WHERE id = ?').get(id) as any;
     if (!row) return undefined;
-    return { ...row, persist_messages: !!row.persist_messages };
+    return this.rowToOrg(row);
   }
 
   listOrgs(): Org[] {
-    return (this.db.prepare('SELECT * FROM orgs ORDER BY created_at').all() as any[]).map(r => ({
-      ...r, persist_messages: !!r.persist_messages
-    }));
+    return (this.db.prepare('SELECT * FROM orgs ORDER BY created_at').all() as any[]).map(r => this.rowToOrg(r));
   }
 
   // ─── Agent Operations ────────────────────────────────────
 
-  registerAgent(orgId: string, name: string, displayName?: string, metadata?: Record<string, unknown>, webhookUrl?: string, webhookSecret?: string): Agent {
+  registerAgent(
+    orgId: string,
+    name: string,
+    displayName?: string | null,
+    metadata?: Record<string, unknown> | null,
+    webhookUrl?: string | null,
+    webhookSecret?: string | null,
+    profile?: AgentProfileInput,
+  ): Agent {
     // Check if agent already exists → return existing token
     const existing = this.db.prepare(
       'SELECT * FROM agents WHERE org_id = ? AND name = ?'
     ).get(orgId, name) as any;
 
+    const now = Date.now();
+    const serializedProfile = this.serializeProfileFields(profile);
+
     if (existing) {
-      // Update last seen, set online, and optionally update webhook
-      if (webhookUrl !== undefined || webhookSecret !== undefined) {
-        this.db.prepare(
-          'UPDATE agents SET online = 1, last_seen_at = ?, webhook_url = COALESCE(?, webhook_url), webhook_secret = COALESCE(?, webhook_secret) WHERE id = ?'
-        ).run(Date.now(), webhookUrl ?? null, webhookSecret ?? null, existing.id);
-      } else {
-        this.db.prepare(
-          'UPDATE agents SET online = 1, last_seen_at = ? WHERE id = ?'
-        ).run(Date.now(), existing.id);
+      const updates: string[] = ['online = 1', 'last_seen_at = ?'];
+      const params: any[] = [now];
+
+      if (displayName !== undefined) {
+        updates.push('display_name = ?');
+        params.push(displayName);
       }
-      return { ...existing, online: true, last_seen_at: Date.now(), webhook_url: webhookUrl ?? existing.webhook_url, webhook_secret: webhookSecret ?? existing.webhook_secret };
+      if (metadata !== undefined) {
+        updates.push('metadata = ?');
+        params.push(metadata === null ? null : JSON.stringify(metadata));
+      }
+      if (webhookUrl !== undefined) {
+        updates.push('webhook_url = ?');
+        params.push(webhookUrl);
+      }
+      if (webhookSecret !== undefined) {
+        updates.push('webhook_secret = ?');
+        params.push(webhookSecret);
+      }
+
+      if (serializedProfile.bio !== undefined) {
+        updates.push('bio = ?');
+        params.push(serializedProfile.bio);
+      }
+      if (serializedProfile.role !== undefined) {
+        updates.push('role = ?');
+        params.push(serializedProfile.role);
+      }
+      if (serializedProfile.function !== undefined) {
+        updates.push('"function" = ?');
+        params.push(serializedProfile.function);
+      }
+      if (serializedProfile.team !== undefined) {
+        updates.push('team = ?');
+        params.push(serializedProfile.team);
+      }
+      if (serializedProfile.tags !== undefined) {
+        updates.push('tags = ?');
+        params.push(serializedProfile.tags);
+      }
+      if (serializedProfile.languages !== undefined) {
+        updates.push('languages = ?');
+        params.push(serializedProfile.languages);
+      }
+      if (serializedProfile.protocols !== undefined) {
+        updates.push('protocols = ?');
+        params.push(serializedProfile.protocols);
+      }
+      if (serializedProfile.status_text !== undefined) {
+        updates.push('status_text = ?');
+        params.push(serializedProfile.status_text);
+      }
+      if (serializedProfile.timezone !== undefined) {
+        updates.push('timezone = ?');
+        params.push(serializedProfile.timezone);
+      }
+      if (serializedProfile.active_hours !== undefined) {
+        updates.push('active_hours = ?');
+        params.push(serializedProfile.active_hours);
+      }
+      if (serializedProfile.version !== undefined) {
+        updates.push('version = ?');
+        params.push(serializedProfile.version);
+      }
+      if (serializedProfile.runtime !== undefined) {
+        updates.push('runtime = ?');
+        params.push(serializedProfile.runtime);
+      }
+
+      params.push(existing.id);
+
+      this.db.prepare(
+        `UPDATE agents SET ${updates.join(', ')} WHERE id = ?`
+      ).run(...params);
+
+      const updated = this.getAgentById(existing.id);
+      if (!updated) {
+        throw new Error('Agent update failed');
+      }
+      return updated;
     }
 
     const agent: Agent = {
-      id: uuid(),
+      id: crypto.randomUUID(),
       org_id: orgId,
       name,
-      display_name: displayName || null,
+      display_name: displayName ?? null,
       token: `agent_${crypto.randomBytes(24).toString('hex')}`,
-      metadata: metadata ? JSON.stringify(metadata) : null,
-      webhook_url: webhookUrl || null,
-      webhook_secret: webhookSecret || null,
+      metadata: metadata === undefined ? null : (metadata === null ? null : JSON.stringify(metadata)),
+      webhook_url: webhookUrl ?? null,
+      webhook_secret: webhookSecret ?? null,
+      bio: serializedProfile.bio ?? null,
+      role: serializedProfile.role ?? null,
+      function: serializedProfile.function ?? null,
+      team: serializedProfile.team ?? null,
+      tags: serializedProfile.tags ?? null,
+      languages: serializedProfile.languages ?? null,
+      protocols: serializedProfile.protocols ?? null,
+      status_text: serializedProfile.status_text ?? null,
+      timezone: serializedProfile.timezone ?? null,
+      active_hours: serializedProfile.active_hours ?? null,
+      version: serializedProfile.version ?? '1.0.0',
+      runtime: serializedProfile.runtime ?? null,
       online: true,
-      last_seen_at: Date.now(),
-      created_at: Date.now(),
+      last_seen_at: now,
+      created_at: now,
     };
 
     this.db.prepare(
-      `INSERT INTO agents (id, org_id, name, display_name, token, metadata, webhook_url, webhook_secret, online, last_seen_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(agent.id, agent.org_id, agent.name, agent.display_name, agent.token,
-          agent.metadata, agent.webhook_url, agent.webhook_secret, agent.online ? 1 : 0, agent.last_seen_at, agent.created_at);
+      `INSERT INTO agents (
+        id, org_id, name, display_name, token, metadata, webhook_url, webhook_secret,
+        bio, role, "function", team, tags, languages, protocols, status_text, timezone, active_hours, version, runtime,
+        online, last_seen_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      agent.id,
+      agent.org_id,
+      agent.name,
+      agent.display_name,
+      agent.token,
+      agent.metadata,
+      agent.webhook_url,
+      agent.webhook_secret,
+      agent.bio,
+      agent.role,
+      agent.function,
+      agent.team,
+      agent.tags,
+      agent.languages,
+      agent.protocols,
+      agent.status_text,
+      agent.timezone,
+      agent.active_hours,
+      agent.version,
+      agent.runtime,
+      agent.online ? 1 : 0,
+      agent.last_seen_at,
+      agent.created_at,
+    );
 
     return agent;
+  }
+
+  updateProfile(agentId: string, fields: AgentProfileInput): Agent | undefined {
+    const serialized = this.serializeProfileFields(fields);
+    const updates: string[] = [];
+    const params: any[] = [];
+
+    if (serialized.bio !== undefined) {
+      updates.push('bio = ?');
+      params.push(serialized.bio);
+    }
+    if (serialized.role !== undefined) {
+      updates.push('role = ?');
+      params.push(serialized.role);
+    }
+    if (serialized.function !== undefined) {
+      updates.push('"function" = ?');
+      params.push(serialized.function);
+    }
+    if (serialized.team !== undefined) {
+      updates.push('team = ?');
+      params.push(serialized.team);
+    }
+    if (serialized.tags !== undefined) {
+      updates.push('tags = ?');
+      params.push(serialized.tags);
+    }
+    if (serialized.languages !== undefined) {
+      updates.push('languages = ?');
+      params.push(serialized.languages);
+    }
+    if (serialized.protocols !== undefined) {
+      updates.push('protocols = ?');
+      params.push(serialized.protocols);
+    }
+    if (serialized.status_text !== undefined) {
+      updates.push('status_text = ?');
+      params.push(serialized.status_text);
+    }
+    if (serialized.timezone !== undefined) {
+      updates.push('timezone = ?');
+      params.push(serialized.timezone);
+    }
+    if (serialized.active_hours !== undefined) {
+      updates.push('active_hours = ?');
+      params.push(serialized.active_hours);
+    }
+    if (serialized.version !== undefined) {
+      updates.push('version = ?');
+      params.push(serialized.version);
+    }
+    if (serialized.runtime !== undefined) {
+      updates.push('runtime = ?');
+      params.push(serialized.runtime);
+    }
+
+    if (updates.length === 0) {
+      return this.getAgentById(agentId);
+    }
+
+    params.push(agentId);
+
+    this.db.prepare(`UPDATE agents SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    return this.getAgentById(agentId);
   }
 
   getAgentByToken(token: string): Agent | undefined {
     const row = this.db.prepare('SELECT * FROM agents WHERE token = ?').get(token) as any;
     if (!row) return undefined;
-    return { ...row, online: !!row.online };
+    return this.rowToAgent(row);
   }
 
   getAgentById(id: string): Agent | undefined {
     const row = this.db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as any;
     if (!row) return undefined;
-    return { ...row, online: !!row.online };
+    return this.rowToAgent(row);
   }
 
   getAgentByName(orgId: string, name: string): Agent | undefined {
@@ -192,13 +493,64 @@ export class HubDB {
       'SELECT * FROM agents WHERE org_id = ? AND name = ?'
     ).get(orgId, name) as any;
     if (!row) return undefined;
-    return { ...row, online: !!row.online };
+    return this.rowToAgent(row);
   }
 
   listAgents(orgId: string): Agent[] {
     return (this.db.prepare(
       'SELECT * FROM agents WHERE org_id = ? ORDER BY name'
-    ).all(orgId) as any[]).map(r => ({ ...r, online: !!r.online }));
+    ).all(orgId) as any[]).map(r => this.rowToAgent(r));
+  }
+
+  listBots(orgId: string, filters?: ListBotsFilters): Agent[] {
+    const where: string[] = ['org_id = ?'];
+    const params: any[] = [orgId];
+
+    if (filters?.role) {
+      where.push("LOWER(COALESCE(role, '')) = LOWER(?)");
+      params.push(filters.role);
+    }
+
+    if (filters?.status) {
+      const status = filters.status.toLowerCase();
+      if (status === 'online') {
+        where.push('online = 1');
+      } else if (status === 'offline') {
+        where.push('online = 0');
+      } else {
+        where.push("LOWER(COALESCE(status_text, '')) = LOWER(?)");
+        params.push(filters.status);
+      }
+    }
+
+    if (filters?.q) {
+      const q = `%${filters.q}%`;
+      where.push(`(
+        LOWER(COALESCE(bio, '')) LIKE LOWER(?)
+        OR LOWER(COALESCE(role, '')) LIKE LOWER(?)
+        OR LOWER(COALESCE("function", '')) LIKE LOWER(?)
+      )`);
+      params.push(q, q, q);
+    }
+
+    let bots = (this.db.prepare(
+      `SELECT * FROM agents WHERE ${where.join(' AND ')} ORDER BY name`
+    ).all(...params) as any[]).map(r => this.rowToAgent(r));
+
+    if (filters?.tag) {
+      const wantedTag = filters.tag.toLowerCase();
+      bots = bots.filter(bot => {
+        if (!bot.tags) return false;
+        try {
+          const tags = JSON.parse(bot.tags) as unknown;
+          return Array.isArray(tags) && tags.some(tag => typeof tag === 'string' && tag.toLowerCase() === wantedTag);
+        } catch {
+          return false;
+        }
+      });
+    }
+
+    return bots;
   }
 
   setAgentOnline(agentId: string, online: boolean) {
@@ -222,7 +574,7 @@ export class HubDB {
     }
 
     const channel: Channel = {
-      id: uuid(),
+      id: crypto.randomUUID(),
       org_id: orgId,
       type,
       name: name || null,
@@ -316,7 +668,7 @@ export class HubDB {
 
   createMessage(channelId: string, senderId: string, content: string, contentType = 'text'): Message {
     const msg: Message = {
-      id: uuid(),
+      id: crypto.randomUUID(),
       channel_id: channelId,
       sender_id: senderId,
       content,
@@ -338,6 +690,7 @@ export class HubDB {
         'SELECT * FROM messages WHERE channel_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?'
       ).all(channelId, before, limit) as Message[];
     }
+
     return this.db.prepare(
       'SELECT * FROM messages WHERE channel_id = ? ORDER BY created_at DESC LIMIT ?'
     ).all(channelId, limit) as Message[];
