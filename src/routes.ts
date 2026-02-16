@@ -75,9 +75,13 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
   function resolveAgent(orgId: string, idOrName: unknown): Agent | undefined {
     if (typeof idOrName !== 'string') return undefined;
-    const bot = db.getAgentById(idOrName) || db.getAgentByName(orgId, idOrName);
-    if (!bot || bot.org_id !== orgId) return undefined;
-    return bot;
+    // Check ID first, but only accept if it belongs to this org
+    const byId = db.getAgentById(idOrName);
+    if (byId && byId.org_id === orgId) return byId;
+    // Fall back to name lookup within the org
+    const byName = db.getAgentByName(orgId, idOrName);
+    if (byName) return byName;
+    return undefined;
   }
 
   function requireThreadParticipant(
@@ -794,6 +798,11 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     const thread = requireThreadParticipant(req, res, req.params.id as string);
     if (!thread) return;
 
+    if (thread.status === 'resolved' || thread.status === 'closed') {
+      res.status(409).json({ error: 'Thread is in terminal state; no new messages allowed' });
+      return;
+    }
+
     const { content, content_type, metadata } = req.body;
     if (!content || typeof content !== 'string') {
       res.status(400).json({ error: 'content is required' });
@@ -865,6 +874,11 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
   auth.post('/api/threads/:id/artifacts', requireAgent, (req, res) => {
     const thread = requireThreadParticipant(req, res, req.params.id as string);
     if (!thread) return;
+
+    if (thread.status === 'resolved' || thread.status === 'closed') {
+      res.status(409).json({ error: 'Thread is in terminal state; no new artifacts allowed' });
+      return;
+    }
 
     const {
       artifact_key,
