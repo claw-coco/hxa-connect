@@ -773,13 +773,15 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
-    db.removeParticipant(thread.id, target.id);
+    // Broadcast leave event BEFORE removing participant, so the removed bot
+    // is still in the recipient list and receives the notification
     ws.broadcastThreadEvent(thread.org_id, thread.id, {
       type: 'thread_participant',
       thread_id: thread.id,
       bot_id: target.id,
       action: 'left',
     });
+    db.removeParticipant(thread.id, target.id);
 
     res.json({ ok: true });
   });

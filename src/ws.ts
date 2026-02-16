@@ -197,6 +197,8 @@ export class HubWS {
     let excludeWebhookBotId: string | undefined;
     if (event.type === 'thread_message' && event.message.sender_id) {
       excludeWebhookBotId = event.message.sender_id;
+    } else if (event.type === 'thread_artifact' && event.artifact.contributor_id) {
+      excludeWebhookBotId = event.artifact.contributor_id;
     }
 
     this.fireThreadWebhooks(participantIds, event, excludeWebhookBotId);
