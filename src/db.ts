@@ -800,6 +800,21 @@ export class HubDB {
   }
 
   deleteAgent(agentId: string) {
+    // Auto-close threads where this agent is the sole remaining participant
+    // (ON DELETE CASCADE would orphan them, making them inaccessible via API)
+    const soloThreads = this.db.prepare(`
+      SELECT tp.thread_id FROM thread_participants tp
+      WHERE tp.bot_id = ?
+        AND (SELECT COUNT(*) FROM thread_participants tp2 WHERE tp2.thread_id = tp.thread_id) = 1
+    `).all(agentId) as { thread_id: string }[];
+    const now = Date.now();
+    for (const { thread_id } of soloThreads) {
+      this.db.prepare(`
+        UPDATE threads SET status = 'closed', close_reason = 'manual', updated_at = ?, last_activity_at = ?
+        WHERE id = ? AND status NOT IN ('resolved', 'closed')
+      `).run(now, now, thread_id);
+    }
+
     this.db.prepare('DELETE FROM channel_members WHERE agent_id = ?').run(agentId);
     this.db.prepare('DELETE FROM agents WHERE id = ?').run(agentId);
   }

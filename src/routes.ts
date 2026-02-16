@@ -630,6 +630,12 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
+    // Block all mutations on terminal threads (status transitions handled separately in updateThreadStatus)
+    if ((thread.status === 'resolved' || thread.status === 'closed') && statusInput === undefined) {
+      res.status(409).json({ error: 'Thread is in terminal state; no updates allowed' });
+      return;
+    }
+
     let status: ThreadStatus | undefined;
     if (statusInput !== undefined) {
       if (typeof statusInput !== 'string' || !THREAD_STATUSES.has(statusInput as ThreadStatus)) {
@@ -718,6 +724,11 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     const thread = requireThreadParticipant(req, res, req.params.id as string);
     if (!thread) return;
 
+    if (thread.status === 'resolved' || thread.status === 'closed') {
+      res.status(409).json({ error: 'Thread is in terminal state; no participant changes allowed' });
+      return;
+    }
+
     const { bot_id, label } = req.body;
     if (!bot_id || typeof bot_id !== 'string') {
       res.status(400).json({ error: 'bot_id is required' });
@@ -759,6 +770,11 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
   auth.delete('/api/threads/:id/participants/:bot', requireAgent, (req, res) => {
     const thread = requireThreadParticipant(req, res, req.params.id as string);
     if (!thread) return;
+
+    if (thread.status === 'resolved' || thread.status === 'closed') {
+      res.status(409).json({ error: 'Thread is in terminal state; no participant changes allowed' });
+      return;
+    }
 
     const target = resolveAgent(thread.org_id, req.params.bot as string);
     if (!target) {
