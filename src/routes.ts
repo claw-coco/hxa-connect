@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { HubDB } from './db.js';
 import type { HubWS } from './ws.js';
 import { authMiddleware, requireAgent, requireOrg } from './auth.js';
-import type { HubConfig, Agent, AgentProfileInput, Thread, ThreadStatus, ThreadType, CloseReason } from './types.js';
+import type { HubConfig, Agent, AgentProfileInput, Thread, ThreadStatus, ThreadType, CloseReason, ArtifactType } from './types.js';
 
 function parseJsonField<T>(value: string | null): T | null {
   if (!value) return null;
@@ -46,6 +46,8 @@ function getQueryString(value: unknown): string | undefined {
 const THREAD_TYPES = new Set<ThreadType>(['discussion', 'request', 'collab']);
 const THREAD_STATUSES = new Set<ThreadStatus>(['open', 'active', 'blocked', 'reviewing', 'resolved', 'closed']);
 const CLOSE_REASONS = new Set<CloseReason>(['manual', 'timeout', 'error']);
+const ARTIFACT_TYPES = new Set<ArtifactType>(['text', 'markdown', 'json', 'code', 'file', 'link']);
+const ARTIFACT_KEY_PATTERN = /^[A-Za-z0-9._~-]+$/;
 
 export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
   const router = Router();
@@ -853,6 +855,157 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     });
 
     res.json(enriched.reverse());
+  });
+
+  /**
+   * POST /api/threads/:id/artifacts — Add artifact (new key or new version)
+   */
+  auth.post('/api/threads/:id/artifacts', requireAgent, (req, res) => {
+    const thread = requireThreadParticipant(req, res, req.params.id as string);
+    if (!thread) return;
+
+    const {
+      artifact_key,
+      type,
+      title,
+      content,
+      language,
+      url,
+      mime_type,
+    } = req.body;
+
+    if (!artifact_key || typeof artifact_key !== 'string' || !ARTIFACT_KEY_PATTERN.test(artifact_key)) {
+      res.status(400).json({ error: 'artifact_key is required and must be URL-safe' });
+      return;
+    }
+
+    const artifactType = (typeof type === 'string' ? type : 'text') as ArtifactType;
+    if (!ARTIFACT_TYPES.has(artifactType)) {
+      res.status(400).json({ error: 'Invalid artifact type' });
+      return;
+    }
+
+    if (title !== undefined && title !== null && typeof title !== 'string') {
+      res.status(400).json({ error: 'title must be a string or null' });
+      return;
+    }
+    if (content !== undefined && content !== null && typeof content !== 'string') {
+      res.status(400).json({ error: 'content must be a string or null' });
+      return;
+    }
+    if (language !== undefined && language !== null && typeof language !== 'string') {
+      res.status(400).json({ error: 'language must be a string or null' });
+      return;
+    }
+    if (url !== undefined && url !== null && typeof url !== 'string') {
+      res.status(400).json({ error: 'url must be a string or null' });
+      return;
+    }
+    if (mime_type !== undefined && mime_type !== null && typeof mime_type !== 'string') {
+      res.status(400).json({ error: 'mime_type must be a string or null' });
+      return;
+    }
+
+    try {
+      const artifact = db.addArtifact(
+        thread.id,
+        req.agent!.id,
+        artifact_key,
+        artifactType,
+        title === undefined ? undefined : (title ?? null),
+        content === undefined ? undefined : (content ?? null),
+        language === undefined ? undefined : (language ?? null),
+        url === undefined ? undefined : (url ?? null),
+        mime_type === undefined ? undefined : (mime_type ?? null),
+      );
+
+      ws.broadcastThreadEvent(thread.org_id, thread.id, {
+        type: 'thread_artifact',
+        thread_id: thread.id,
+        artifact,
+        action: 'added',
+      });
+
+      res.json(artifact);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to add artifact' });
+    }
+  });
+
+  /**
+   * PATCH /api/threads/:id/artifacts/:key — Update artifact (new version)
+   */
+  auth.patch('/api/threads/:id/artifacts/:key', requireAgent, (req, res) => {
+    const thread = requireThreadParticipant(req, res, req.params.id as string);
+    if (!thread) return;
+
+    const key = req.params.key as string;
+    if (!key || !ARTIFACT_KEY_PATTERN.test(key)) {
+      res.status(400).json({ error: 'Invalid artifact key' });
+      return;
+    }
+
+    const { content, title } = req.body;
+    if (typeof content !== 'string') {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+    if (title !== undefined && title !== null && typeof title !== 'string') {
+      res.status(400).json({ error: 'title must be a string or null' });
+      return;
+    }
+
+    try {
+      const artifact = db.updateArtifact(
+        thread.id,
+        key,
+        req.agent!.id,
+        content,
+        title === undefined ? undefined : (title ?? null),
+      );
+
+      if (!artifact) {
+        res.status(404).json({ error: 'Artifact not found' });
+        return;
+      }
+
+      ws.broadcastThreadEvent(thread.org_id, thread.id, {
+        type: 'thread_artifact',
+        thread_id: thread.id,
+        artifact,
+        action: 'updated',
+      });
+
+      res.json(artifact);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to update artifact' });
+    }
+  });
+
+  /**
+   * GET /api/threads/:id/artifacts — List latest artifact version for each key
+   */
+  auth.get('/api/threads/:id/artifacts', requireAgent, (req, res) => {
+    const thread = requireThreadParticipant(req, res, req.params.id as string);
+    if (!thread) return;
+
+    res.json(db.listArtifacts(thread.id));
+  });
+
+  /**
+   * GET /api/threads/:id/artifacts/:key/versions — List all versions for a key
+   */
+  auth.get('/api/threads/:id/artifacts/:key/versions', requireAgent, (req, res) => {
+    const thread = requireThreadParticipant(req, res, req.params.id as string);
+    if (!thread) return;
+
+    const key = req.params.key as string;
+    if (!key || !ARTIFACT_KEY_PATTERN.test(key)) {
+      res.status(400).json({ error: 'Invalid artifact key' });
+      return;
+    }
+
+    res.json(db.getArtifactVersions(thread.id, key));
   });
 
   // ─── Messages ─────────────────────────────────────────────

@@ -14,6 +14,8 @@ import type {
   Thread,
   ThreadParticipant,
   ThreadMessage,
+  Artifact,
+  ArtifactType,
   ThreadType,
   ThreadStatus,
   CloseReason,
@@ -120,6 +122,25 @@ export class HubDB {
         created_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS artifacts (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        artifact_key TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'text'
+          CHECK(type IN ('text', 'markdown', 'json', 'code', 'file', 'link')),
+        title TEXT,
+        content TEXT,
+        language TEXT,
+        url TEXT,
+        mime_type TEXT,
+        contributor_id TEXT NOT NULL REFERENCES agents(id),
+        version INTEGER NOT NULL DEFAULT 1,
+        format_warning INTEGER DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(thread_id, artifact_key, version)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_agents_org ON agents(org_id);
       CREATE INDEX IF NOT EXISTS idx_channels_org ON channels(org_id);
@@ -129,6 +150,7 @@ export class HubDB {
       CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_activity_at);
       CREATE INDEX IF NOT EXISTS idx_thread_participants_bot ON thread_participants(bot_id);
       CREATE INDEX IF NOT EXISTS idx_thread_messages ON thread_messages(thread_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id, created_at);
     `);
 
     // Migration: add admin_secret to existing orgs that don't have it
@@ -262,6 +284,18 @@ export class HubDB {
     };
   }
 
+  private rowToArtifact(row: any): Artifact {
+    return {
+      ...row,
+      title: row.title ?? null,
+      content: row.content ?? null,
+      language: row.language ?? null,
+      url: row.url ?? null,
+      mime_type: row.mime_type ?? null,
+      format_warning: !!row.format_warning,
+    };
+  }
+
   private serializeProfileFields(fields?: AgentProfileInput): {
     bio?: string | null;
     role?: string | null;
@@ -291,6 +325,36 @@ export class HubDB {
       version: fields.version,
       runtime: fields.runtime,
     };
+  }
+
+  private normalizeJsonArtifactContent(type: ArtifactType, content: string | null): {
+    type: ArtifactType;
+    content: string | null;
+    format_warning: boolean;
+  } {
+    if (type !== 'json' || content === null) {
+      return { type, content, format_warning: false };
+    }
+
+    try {
+      JSON.parse(content);
+      return { type: 'json', content, format_warning: false };
+    } catch {
+      // Continue to tolerant parsing fallback
+    }
+
+    const withoutTrailingCommas = content.replace(/,\s*([}\]])/g, '$1');
+    const withDoubleQuotes = withoutTrailingCommas.replace(
+      /'([^'\\]*(?:\\.[^'\\]*)*)'/g,
+      (_match, inner: string) => `"${inner.replace(/"/g, '\\"')}"`,
+    );
+
+    try {
+      JSON.parse(withDoubleQuotes);
+      return { type: 'json', content: withDoubleQuotes, format_warning: false };
+    } catch {
+      return { type: 'text', content, format_warning: true };
+    }
   }
 
   // ─── Org Operations ──────────────────────────────────────
@@ -1070,6 +1134,195 @@ export class HubDB {
         `).all(threadId, limit) as any[]);
 
     return rows.map(row => this.rowToThreadMessage(row));
+  }
+
+  addArtifact(
+    threadId: string,
+    contributorId: string,
+    key: string,
+    type: ArtifactType,
+    title?: string | null,
+    content?: string | null,
+    language?: string | null,
+    url?: string | null,
+    mimeType?: string | null,
+  ): Artifact {
+    const now = Date.now();
+    const nextVersionRow = this.db.prepare(`
+      SELECT MAX(version) as max_version FROM artifacts
+      WHERE thread_id = ? AND artifact_key = ?
+    `).get(threadId, key) as { max_version: number | null };
+    const nextVersion = (nextVersionRow?.max_version ?? 0) + 1;
+
+    const normalized = this.normalizeJsonArtifactContent(type, content ?? null);
+    const artifact: Artifact = {
+      id: crypto.randomUUID(),
+      thread_id: threadId,
+      artifact_key: key,
+      type: normalized.type,
+      title: title ?? null,
+      content: normalized.content,
+      language: language ?? null,
+      url: url ?? null,
+      mime_type: mimeType ?? null,
+      contributor_id: contributorId,
+      version: nextVersion,
+      format_warning: normalized.format_warning,
+      created_at: now,
+      updated_at: now,
+    };
+
+    const insertArtifactStmt = this.db.prepare(`
+      INSERT INTO artifacts (
+        id, thread_id, artifact_key, type, title, content, language, url, mime_type,
+        contributor_id, version, format_warning, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const updateActivityStmt = this.db.prepare(`
+      UPDATE threads SET last_activity_at = ? WHERE id = ?
+    `);
+
+    const tx = this.db.transaction(() => {
+      insertArtifactStmt.run(
+        artifact.id,
+        artifact.thread_id,
+        artifact.artifact_key,
+        artifact.type,
+        artifact.title,
+        artifact.content,
+        artifact.language,
+        artifact.url,
+        artifact.mime_type,
+        artifact.contributor_id,
+        artifact.version,
+        artifact.format_warning ? 1 : 0,
+        artifact.created_at,
+        artifact.updated_at,
+      );
+      updateActivityStmt.run(now, threadId);
+    });
+
+    tx();
+    return artifact;
+  }
+
+  updateArtifact(
+    threadId: string,
+    key: string,
+    contributorId: string,
+    content: string,
+    title?: string | null,
+  ): Artifact | undefined {
+    const latestRow = this.db.prepare(`
+      SELECT * FROM artifacts
+      WHERE thread_id = ? AND artifact_key = ?
+      ORDER BY version DESC
+      LIMIT 1
+    `).get(threadId, key) as any;
+
+    if (!latestRow) return undefined;
+    const latest = this.rowToArtifact(latestRow);
+    const nextVersionRow = this.db.prepare(`
+      SELECT MAX(version) as max_version FROM artifacts
+      WHERE thread_id = ? AND artifact_key = ?
+    `).get(threadId, key) as { max_version: number | null };
+    const nextVersion = (nextVersionRow?.max_version ?? latest.version) + 1;
+
+    const now = Date.now();
+    const normalized = this.normalizeJsonArtifactContent(latest.type, content);
+    const artifact: Artifact = {
+      id: crypto.randomUUID(),
+      thread_id: threadId,
+      artifact_key: key,
+      type: normalized.type,
+      title: title === undefined ? latest.title : (title ?? null),
+      content: normalized.content,
+      language: latest.language,
+      url: latest.url,
+      mime_type: latest.mime_type,
+      contributor_id: contributorId,
+      version: nextVersion,
+      format_warning: normalized.format_warning,
+      created_at: now,
+      updated_at: now,
+    };
+
+    const insertArtifactStmt = this.db.prepare(`
+      INSERT INTO artifacts (
+        id, thread_id, artifact_key, type, title, content, language, url, mime_type,
+        contributor_id, version, format_warning, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const updateActivityStmt = this.db.prepare(`
+      UPDATE threads SET last_activity_at = ? WHERE id = ?
+    `);
+
+    const tx = this.db.transaction(() => {
+      insertArtifactStmt.run(
+        artifact.id,
+        artifact.thread_id,
+        artifact.artifact_key,
+        artifact.type,
+        artifact.title,
+        artifact.content,
+        artifact.language,
+        artifact.url,
+        artifact.mime_type,
+        artifact.contributor_id,
+        artifact.version,
+        artifact.format_warning ? 1 : 0,
+        artifact.created_at,
+        artifact.updated_at,
+      );
+      updateActivityStmt.run(now, threadId);
+    });
+
+    tx();
+    return artifact;
+  }
+
+  getArtifact(threadId: string, key: string, version?: number): Artifact | undefined {
+    const row = version === undefined
+      ? this.db.prepare(`
+          SELECT * FROM artifacts
+          WHERE thread_id = ? AND artifact_key = ?
+          ORDER BY version DESC
+          LIMIT 1
+        `).get(threadId, key)
+      : this.db.prepare(`
+          SELECT * FROM artifacts
+          WHERE thread_id = ? AND artifact_key = ? AND version = ?
+          LIMIT 1
+        `).get(threadId, key, version);
+
+    if (!row) return undefined;
+    return this.rowToArtifact(row);
+  }
+
+  listArtifacts(threadId: string): Artifact[] {
+    const rows = this.db.prepare(`
+      SELECT a.* FROM artifacts a
+      JOIN (
+        SELECT artifact_key, MAX(version) as max_version
+        FROM artifacts
+        WHERE thread_id = ?
+        GROUP BY artifact_key
+      ) latest ON a.artifact_key = latest.artifact_key AND a.version = latest.max_version
+      WHERE a.thread_id = ?
+      ORDER BY a.created_at ASC
+    `).all(threadId, threadId) as any[];
+
+    return rows.map(row => this.rowToArtifact(row));
+  }
+
+  getArtifactVersions(threadId: string, key: string): Artifact[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM artifacts
+      WHERE thread_id = ? AND artifact_key = ?
+      ORDER BY version ASC
+    `).all(threadId, key) as any[];
+
+    return rows.map(row => this.rowToArtifact(row));
   }
 
   close() {

@@ -95,6 +95,25 @@ export interface ThreadMessage {
   created_at: number;
 }
 
+export type ArtifactType = 'text' | 'markdown' | 'json' | 'code' | 'file' | 'link';
+
+export interface Artifact {
+  id: string;
+  thread_id: string;
+  artifact_key: string;
+  type: ArtifactType;
+  title: string | null;
+  content: string | null;
+  language: string | null;
+  url: string | null;
+  mime_type: string | null;
+  contributor_id: string;
+  version: number;
+  format_warning: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
 // ─── API Request/Response Types ──────────────────────────────
 
 export interface BotProtocols {
@@ -181,6 +200,7 @@ export type WsServerEvent =
   | { type: 'thread_created'; thread: Thread }
   | { type: 'thread_updated'; thread: Thread; changes: string[] }
   | { type: 'thread_message'; thread_id: string; message: ThreadMessage }
+  | { type: 'thread_artifact'; thread_id: string; artifact: Artifact; action: 'added' | 'updated' }
   | { type: 'thread_participant'; thread_id: string; bot_id: string; action: 'joined' | 'left' }
   | { type: 'error'; message: string }
   | { type: 'pong' };
