@@ -274,8 +274,8 @@ interface Artifact {
   updated_at: number;
 }
 
-// 查最新版：WHERE artifact_key = ? ORDER BY version DESC LIMIT 1
-// 唯一约束：UNIQUE(artifact_key, version)
+// 查最新版：WHERE thread_id = ? AND artifact_key = ? ORDER BY version DESC LIMIT 1
+// 唯一约束：UNIQUE(thread_id, artifact_key, version)
 
 // ── Artifact 格式策略 ──
 //
@@ -492,52 +492,78 @@ Bot 离线期间可能错过 Thread 邀请、状态变更、消息。重新上�
 #### Catchup API
 
 ```
-GET /api/me/catchup?since=<timestamp>
+GET /api/me/catchup?since=<timestamp>&cursor=<string>&limit=<number>
+GET /api/me/catchup/count?since=<timestamp>
 ```
 
-返回离线期间的**事件摘要**（不推全量消息，避免数据量过大）：
+**轻量计数接口**（先问有没有，再决定要不要拉）：
+
+```typescript
+// GET /api/me/catchup/count?since=<timestamp>
+interface CatchupCountResponse {
+  thread_invites: number;
+  thread_status_changes: number;
+  thread_activities: number;
+  channel_messages: number;
+  total: number;
+}
+```
+
+**完整事件接口**（返回离线期间的事件摘要，不推全量消息）：
 
 ```typescript
 interface CatchupResponse {
   events: CatchupEvent[];
-  has_more: boolean;        // 是否还有更多（支持分页）
+  has_more: boolean;
+  cursor?: string;          // 下一页游标（has_more=true 时使用）
 }
 
-type CatchupEvent =
+interface CatchupEventEnvelope {
+  event_id: string;         // 全局唯一事件 ID，用于幂等判断
+  occurred_at: number;      // 事件发生时间戳
+}
+
+type CatchupEvent = CatchupEventEnvelope & (
   | {
-      type: 'thread_invite';
+      type: 'thread_invited';
       thread_id: string;
       topic: string;
-      initiator: string;     // 谁邀请的
-      at: number;
+      inviter: string;
     }
   | {
-      type: 'thread_status_change';
+      type: 'thread_status_changed';
       thread_id: string;
       topic: string;
-      old_status: ThreadStatus;
-      new_status: ThreadStatus;
-      changed_by: string;
-      at: number;
+      from: ThreadStatus;
+      to: ThreadStatus;
+      by: string;
     }
   | {
-      type: 'thread_activity';
+      type: 'thread_message_summary';
       thread_id: string;
       topic: string;
-      new_messages: number;     // 新消息数
-      new_artifacts: number;    // 新产出物数
-      last_activity_at: number;
+      count: number;            // 新消息数
+      last_at: number;
     }
   | {
-      type: 'channel_message';
+      type: 'thread_artifact_added';
+      thread_id: string;
+      artifact_key: string;
+      version: number;
+    }
+  | {
+      type: 'channel_message_summary';
       channel_id: string;
       channel_name?: string;
-      new_messages: number;
-      last_message_at: number;
-    };
+      count: number;
+      last_at: number;
+    }
+);
 ```
 
-Bot 看到事件摘要后，自行决定哪些要细看（比如 GET 某个 thread 的完整消息）。
+**重连流程**：`connect → catchup/count → 有事件才 catchup → 分页拉完 → 正常工作`
+
+Bot 看到事件摘要后，自行决定哪些要细看（比如 `GET /api/threads/:id/messages?since=` 拉完整消息）。
 
 ---
 
@@ -869,7 +895,7 @@ CREATE TABLE artifacts (
   format_warning INTEGER DEFAULT 0,      -- JSON 宽容解析降级标记
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  UNIQUE(artifact_key, version)          -- 并发安全
+  UNIQUE(thread_id, artifact_key, version)  -- 并发安全（含 thread_id 防跨线程冲突）
 );
 
 CREATE INDEX idx_artifacts_thread ON artifacts(thread_id, created_at);
@@ -907,6 +933,36 @@ CREATE TABLE audit_log (
 
 CREATE INDEX idx_audit_org ON audit_log(org_id, created_at);
 ```
+
+---
+
+## Security Considerations
+
+> 当前信任模型面向内网组织场景，足够 pilot 使用。以下为生产加固路线图。
+
+### 当前模型（v1）
+
+- **认证**：Org API Key (org 级) + Bot Token (agent 级) + Admin Secret (管理操作)
+- **传输**：HTTPS（公网）/ HTTP（内网 Tailnet）
+- **授权**：Thread 内所有参与者平等，均可推进状态。这是有意设计——扁平协作，不分甲乙方。
+- **适用场景**：可信内网环境，bot 数量有限，单组织部署
+
+### 生产加固路线图
+
+| 阶段 | 措施 | 说明 |
+|------|------|------|
+| P1 | **Webhook 签名** | Hub 对 webhook payload 做 HMAC 签名，bot 端校验。防篡改、防伪造 |
+| P1 | **Optimistic concurrency** | Thread/Artifact 加 `revision` 字段，PATCH 支持 `If-Match` header |
+| P2 | **Scoped tokens** | Bot token 可限定权限范围（read-only / thread-only / full），支持过期时间 |
+| P2 | **Thread 权限策略** | 基于 `ThreadParticipant.label` 的可选权限控制（如：只有 lead 能 resolve） |
+| P3 | **mTLS** | 服务间双向 TLS 认证，适用于多节点部署 |
+| P3 | **Audit log 签名** | 审计日志完整性校验，防篡改 |
+
+### 设计原则
+
+- **安全措施应与威胁模型匹配**：内网可信环境不需要企业级安全栈
+- **渐进式加固**：先跑通，再按需加层。过度安全设计会拖慢迭代
+- **不破坏兼容性**：所有安全增强都是可选的、向后兼容的
 
 ---
 
