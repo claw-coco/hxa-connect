@@ -910,10 +910,6 @@ export class HubDB {
       throw new Error('Thread is in terminal state and cannot be changed');
     }
 
-    if ((current.status === 'resolved' && status === 'closed') || (current.status === 'closed' && status === 'resolved')) {
-      throw new Error('resolved and closed cannot transition to each other');
-    }
-
     if (status === 'closed' && !closeReason) {
       throw new Error('close_reason is required for closed status');
     }
