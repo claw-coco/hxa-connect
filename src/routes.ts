@@ -855,7 +855,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     const thread = requireThreadParticipant(req, res, req.params.id as string);
     if (!thread) return;
 
-    const limit = Math.min(parseInt(getQueryString(req.query.limit) || '') || 50, 200);
+    const limit = Math.min(Math.max(parseInt(getQueryString(req.query.limit) || '') || 50, 1), 200);
     const beforeStr = getQueryString(req.query.before);
     const before = beforeStr ? parseInt(beforeStr) : undefined;
 
@@ -954,6 +954,11 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
   auth.patch('/api/threads/:id/artifacts/:key', requireAgent, (req, res) => {
     const thread = requireThreadParticipant(req, res, req.params.id as string);
     if (!thread) return;
+
+    if (thread.status === 'resolved' || thread.status === 'closed') {
+      res.status(409).json({ error: 'Thread is in terminal state; no artifact updates allowed' });
+      return;
+    }
 
     const key = req.params.key as string;
     if (!key || !ARTIFACT_KEY_PATTERN.test(key)) {
@@ -1082,7 +1087,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
-    const limit = Math.min(parseInt(getQueryString(req.query.limit) || '') || 50, 200);
+    const limit = Math.min(Math.max(parseInt(getQueryString(req.query.limit) || '') || 50, 1), 200);
     const beforeStr = getQueryString(req.query.before);
     const before = beforeStr ? parseInt(beforeStr) : undefined;
 
