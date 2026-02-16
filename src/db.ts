@@ -2,7 +2,22 @@ import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
-import type { Org, Agent, Channel, ChannelMember, Message, HubConfig, AgentProfileInput, ListBotsFilters } from './types.js';
+import type {
+  Org,
+  Agent,
+  Channel,
+  ChannelMember,
+  Message,
+  HubConfig,
+  AgentProfileInput,
+  ListBotsFilters,
+  Thread,
+  ThreadParticipant,
+  ThreadMessage,
+  ThreadType,
+  ThreadStatus,
+  CloseReason,
+} from './types.js';
 
 // ─── Database Layer ──────────────────────────────────────────
 
@@ -68,10 +83,52 @@ export class HubDB {
         created_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS threads (
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+        topic TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'discussion'
+          CHECK(type IN ('discussion', 'request', 'collab')),
+        status TEXT NOT NULL DEFAULT 'open'
+          CHECK(status IN ('open', 'active', 'blocked', 'reviewing', 'resolved', 'closed')),
+        initiator_id TEXT NOT NULL REFERENCES agents(id),
+        channel_id TEXT REFERENCES channels(id),
+        context TEXT,
+        close_reason TEXT
+          CHECK(close_reason IS NULL OR close_reason IN ('manual', 'timeout', 'error')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        last_activity_at INTEGER NOT NULL,
+        resolved_at INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS thread_participants (
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        bot_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        label TEXT,
+        joined_at INTEGER NOT NULL,
+        PRIMARY KEY(thread_id, bot_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS thread_messages (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        sender_id TEXT NOT NULL REFERENCES agents(id),
+        content TEXT NOT NULL,
+        content_type TEXT DEFAULT 'text',
+        metadata TEXT,
+        created_at INTEGER NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_agents_org ON agents(org_id);
       CREATE INDEX IF NOT EXISTS idx_channels_org ON channels(org_id);
       CREATE INDEX IF NOT EXISTS idx_channel_members_agent ON channel_members(agent_id);
+      CREATE INDEX IF NOT EXISTS idx_threads_org ON threads(org_id, status);
+      CREATE INDEX IF NOT EXISTS idx_threads_initiator ON threads(initiator_id);
+      CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_activity_at);
+      CREATE INDEX IF NOT EXISTS idx_thread_participants_bot ON thread_participants(bot_id);
+      CREATE INDEX IF NOT EXISTS idx_thread_messages ON thread_messages(thread_id, created_at);
     `);
 
     // Migration: add admin_secret to existing orgs that don't have it
@@ -177,6 +234,31 @@ export class HubDB {
       version: row.version ?? '1.0.0',
       runtime: row.runtime ?? null,
       online: !!row.online,
+    };
+  }
+
+  private rowToThread(row: any): Thread {
+    return {
+      ...row,
+      channel_id: row.channel_id ?? null,
+      context: row.context ?? null,
+      close_reason: row.close_reason ?? null,
+      resolved_at: row.resolved_at ?? null,
+    };
+  }
+
+  private rowToThreadMessage(row: any): ThreadMessage {
+    return {
+      ...row,
+      content_type: row.content_type ?? 'text',
+      metadata: row.metadata ?? null,
+    };
+  }
+
+  private rowToThreadParticipant(row: any): ThreadParticipant {
+    return {
+      ...row,
+      label: row.label ?? null,
     };
   }
 
@@ -705,6 +787,293 @@ export class HubDB {
       ORDER BY m.created_at ASC
       LIMIT 100
     `).all(agentId, since, agentId) as any[];
+  }
+
+  // ─── Thread Operations ───────────────────────────────────
+
+  createThread(
+    orgId: string,
+    initiatorId: string,
+    topic: string,
+    type: ThreadType,
+    participantIds: string[],
+    channelId?: string | null,
+    context?: string | null,
+  ): Thread {
+    const uniqueParticipantIds = Array.from(new Set([initiatorId, ...participantIds]));
+    if (uniqueParticipantIds.length > 20) {
+      throw new Error('Thread participant limit exceeded (max 20)');
+    }
+
+    const now = Date.now();
+    const thread: Thread = {
+      id: crypto.randomUUID(),
+      org_id: orgId,
+      topic,
+      type,
+      status: 'open',
+      initiator_id: initiatorId,
+      channel_id: channelId ?? null,
+      context: context ?? null,
+      close_reason: null,
+      created_at: now,
+      updated_at: now,
+      last_activity_at: now,
+      resolved_at: null,
+    };
+
+    const getAgentOrgStmt = this.db.prepare('SELECT org_id FROM agents WHERE id = ?');
+    const getChannelOrgStmt = this.db.prepare('SELECT org_id FROM channels WHERE id = ?');
+    const insertThreadStmt = this.db.prepare(`
+      INSERT INTO threads (
+        id, org_id, topic, type, status, initiator_id, channel_id, context, close_reason,
+        created_at, updated_at, last_activity_at, resolved_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertParticipantStmt = this.db.prepare(`
+      INSERT INTO thread_participants (thread_id, bot_id, label, joined_at)
+      VALUES (?, ?, ?, ?)
+    `);
+
+    const tx = this.db.transaction(() => {
+      const initiatorRow = getAgentOrgStmt.get(initiatorId) as { org_id: string } | undefined;
+      if (!initiatorRow || initiatorRow.org_id !== orgId) {
+        throw new Error('Invalid initiator');
+      }
+
+      for (const participantId of uniqueParticipantIds) {
+        const participantRow = getAgentOrgStmt.get(participantId) as { org_id: string } | undefined;
+        if (!participantRow || participantRow.org_id !== orgId) {
+          throw new Error(`Participant not in org: ${participantId}`);
+        }
+      }
+
+      if (channelId) {
+        const channelRow = getChannelOrgStmt.get(channelId) as { org_id: string } | undefined;
+        if (!channelRow || channelRow.org_id !== orgId) {
+          throw new Error('Invalid channel_id for thread org');
+        }
+      }
+
+      insertThreadStmt.run(
+        thread.id,
+        thread.org_id,
+        thread.topic,
+        thread.type,
+        thread.status,
+        thread.initiator_id,
+        thread.channel_id,
+        thread.context,
+        thread.close_reason,
+        thread.created_at,
+        thread.updated_at,
+        thread.last_activity_at,
+        thread.resolved_at,
+      );
+
+      for (const participantId of uniqueParticipantIds) {
+        insertParticipantStmt.run(thread.id, participantId, null, now);
+      }
+    });
+
+    tx();
+    return thread;
+  }
+
+  getThread(threadId: string): Thread | undefined {
+    const row = this.db.prepare('SELECT * FROM threads WHERE id = ?').get(threadId) as any;
+    if (!row) return undefined;
+    return this.rowToThread(row);
+  }
+
+  listThreadsForAgent(agentId: string, status?: ThreadStatus): Thread[] {
+    const base = `
+      SELECT t.* FROM threads t
+      JOIN thread_participants tp ON t.id = tp.thread_id
+      WHERE tp.bot_id = ?
+    `;
+
+    const query = status
+      ? `${base} AND t.status = ? ORDER BY t.last_activity_at DESC`
+      : `${base} ORDER BY t.last_activity_at DESC`;
+    const rows = status
+      ? (this.db.prepare(query).all(agentId, status) as any[])
+      : (this.db.prepare(query).all(agentId) as any[]);
+    return rows.map(row => this.rowToThread(row));
+  }
+
+  updateThreadStatus(threadId: string, status: ThreadStatus, closeReason?: CloseReason | null): Thread | undefined {
+    const current = this.getThread(threadId);
+    if (!current) return undefined;
+
+    if (current.status === 'resolved' || current.status === 'closed') {
+      throw new Error('Thread is in terminal state and cannot be changed');
+    }
+
+    if ((current.status === 'resolved' && status === 'closed') || (current.status === 'closed' && status === 'resolved')) {
+      throw new Error('resolved and closed cannot transition to each other');
+    }
+
+    if (status === 'closed' && !closeReason) {
+      throw new Error('close_reason is required for closed status');
+    }
+
+    if (status !== 'closed' && closeReason) {
+      throw new Error('close_reason is only allowed with closed status');
+    }
+
+    const now = Date.now();
+    const resolvedAt = status === 'resolved' && current.resolved_at === null ? now : current.resolved_at;
+    const reason = status === 'closed' ? (closeReason ?? null) : null;
+
+    this.db.prepare(`
+      UPDATE threads
+      SET status = ?, close_reason = ?, resolved_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(status, reason, resolvedAt, now, threadId);
+
+    return this.getThread(threadId);
+  }
+
+  updateThreadContext(threadId: string, context: string | null): Thread | undefined {
+    const current = this.getThread(threadId);
+    if (!current) return undefined;
+
+    this.db.prepare(`
+      UPDATE threads
+      SET context = ?, updated_at = ?
+      WHERE id = ?
+    `).run(context, Date.now(), threadId);
+
+    return this.getThread(threadId);
+  }
+
+  addParticipant(threadId: string, botId: string, label?: string | null): ThreadParticipant {
+    const thread = this.getThread(threadId);
+    if (!thread) {
+      throw new Error('Thread not found');
+    }
+
+    const agent = this.getAgentById(botId);
+    if (!agent || agent.org_id !== thread.org_id) {
+      throw new Error('Participant bot not found in thread org');
+    }
+
+    const existing = this.db.prepare(`
+      SELECT * FROM thread_participants WHERE thread_id = ? AND bot_id = ?
+    `).get(threadId, botId) as any;
+
+    if (existing) {
+      if (label !== undefined) {
+        this.db.prepare(`
+          UPDATE thread_participants SET label = ? WHERE thread_id = ? AND bot_id = ?
+        `).run(label ?? null, threadId, botId);
+        const updated = this.db.prepare(`
+          SELECT * FROM thread_participants WHERE thread_id = ? AND bot_id = ?
+        `).get(threadId, botId) as any;
+        return this.rowToThreadParticipant(updated);
+      }
+      return this.rowToThreadParticipant(existing);
+    }
+
+    const countRow = this.db.prepare(`
+      SELECT COUNT(*) as count FROM thread_participants WHERE thread_id = ?
+    `).get(threadId) as { count: number };
+
+    if (countRow.count >= 20) {
+      throw new Error('Thread participant limit exceeded (max 20)');
+    }
+
+    this.db.prepare(`
+      INSERT INTO thread_participants (thread_id, bot_id, label, joined_at)
+      VALUES (?, ?, ?, ?)
+    `).run(threadId, botId, label ?? null, Date.now());
+
+    const row = this.db.prepare(`
+      SELECT * FROM thread_participants WHERE thread_id = ? AND bot_id = ?
+    `).get(threadId, botId) as any;
+
+    return this.rowToThreadParticipant(row);
+  }
+
+  removeParticipant(threadId: string, botId: string) {
+    this.db.prepare(`
+      DELETE FROM thread_participants WHERE thread_id = ? AND bot_id = ?
+    `).run(threadId, botId);
+  }
+
+  getParticipants(threadId: string): ThreadParticipant[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM thread_participants WHERE thread_id = ? ORDER BY joined_at
+    `).all(threadId) as any[];
+    return rows.map(row => this.rowToThreadParticipant(row));
+  }
+
+  isParticipant(threadId: string, botId: string): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM thread_participants WHERE thread_id = ? AND bot_id = ?
+    `).get(threadId, botId);
+    return !!row;
+  }
+
+  createThreadMessage(
+    threadId: string,
+    senderId: string,
+    content: string,
+    contentType = 'text',
+    metadata?: string | null,
+  ): ThreadMessage {
+    const msg: ThreadMessage = {
+      id: crypto.randomUUID(),
+      thread_id: threadId,
+      sender_id: senderId,
+      content,
+      content_type: contentType,
+      metadata: metadata ?? null,
+      created_at: Date.now(),
+    };
+
+    const insertMessageStmt = this.db.prepare(`
+      INSERT INTO thread_messages (id, thread_id, sender_id, content, content_type, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    const updateActivityStmt = this.db.prepare(`
+      UPDATE threads SET last_activity_at = ? WHERE id = ?
+    `);
+
+    const tx = this.db.transaction(() => {
+      insertMessageStmt.run(
+        msg.id,
+        msg.thread_id,
+        msg.sender_id,
+        msg.content,
+        msg.content_type,
+        msg.metadata,
+        msg.created_at,
+      );
+      updateActivityStmt.run(msg.created_at, threadId);
+    });
+
+    tx();
+    return msg;
+  }
+
+  getThreadMessages(threadId: string, limit = 50, before?: number): ThreadMessage[] {
+    const rows = before
+      ? (this.db.prepare(`
+          SELECT * FROM thread_messages
+          WHERE thread_id = ? AND created_at < ?
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).all(threadId, before, limit) as any[])
+      : (this.db.prepare(`
+          SELECT * FROM thread_messages
+          WHERE thread_id = ?
+          ORDER BY created_at DESC
+          LIMIT ?
+        `).all(threadId, limit) as any[]);
+
+    return rows.map(row => this.rowToThreadMessage(row));
   }
 
   close() {

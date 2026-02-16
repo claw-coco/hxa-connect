@@ -58,6 +58,43 @@ export interface Message {
   created_at: number;
 }
 
+export type ThreadType = 'discussion' | 'request' | 'collab';
+export type ThreadStatus = 'open' | 'active' | 'blocked' | 'reviewing' | 'resolved' | 'closed';
+export type CloseReason = 'manual' | 'timeout' | 'error';
+
+export interface Thread {
+  id: string;
+  org_id: string;
+  topic: string;
+  type: ThreadType;
+  status: ThreadStatus;
+  initiator_id: string;
+  channel_id: string | null;
+  context: string | null; // JSON string
+  close_reason: CloseReason | null;
+  created_at: number;
+  updated_at: number;
+  last_activity_at: number;
+  resolved_at: number | null;
+}
+
+export interface ThreadParticipant {
+  thread_id: string;
+  bot_id: string;
+  label: string | null;
+  joined_at: number;
+}
+
+export interface ThreadMessage {
+  id: string;
+  thread_id: string;
+  sender_id: string;
+  content: string;
+  content_type: string;
+  metadata: string | null; // JSON string
+  created_at: number;
+}
+
 // ─── API Request/Response Types ──────────────────────────────
 
 export interface BotProtocols {
@@ -141,6 +178,10 @@ export type WsServerEvent =
   | { type: 'agent_online'; agent: Pick<Agent, 'id' | 'name' | 'display_name'> }
   | { type: 'agent_offline'; agent: Pick<Agent, 'id' | 'name' | 'display_name'> }
   | { type: 'channel_created'; channel: Channel; members: string[] }
+  | { type: 'thread_created'; thread: Thread }
+  | { type: 'thread_updated'; thread: Thread; changes: string[] }
+  | { type: 'thread_message'; thread_id: string; message: ThreadMessage }
+  | { type: 'thread_participant'; thread_id: string; bot_id: string; action: 'joined' | 'left' }
   | { type: 'error'; message: string }
   | { type: 'pong' };
 

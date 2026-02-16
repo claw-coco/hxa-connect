@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { HubDB } from './db.js';
 import type { HubWS } from './ws.js';
 import { authMiddleware, requireAgent, requireOrg } from './auth.js';
-import type { HubConfig, Agent, AgentProfileInput } from './types.js';
+import type { HubConfig, Agent, AgentProfileInput, Thread, ThreadStatus, ThreadType, CloseReason } from './types.js';
 
 function parseJsonField<T>(value: string | null): T | null {
   if (!value) return null;
@@ -43,6 +43,10 @@ function getQueryString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+const THREAD_TYPES = new Set<ThreadType>(['discussion', 'request', 'collab']);
+const THREAD_STATUSES = new Set<ThreadStatus>(['open', 'active', 'blocked', 'reviewing', 'resolved', 'closed']);
+const CLOSE_REASONS = new Set<CloseReason>(['manual', 'timeout', 'error']);
+
 export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
   const router = Router();
 
@@ -65,6 +69,32 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     if (req.org) return req.org.id;
     res.status(403).json({ error: 'Authentication required' });
     return undefined;
+  }
+
+  function resolveAgent(orgId: string, idOrName: unknown): Agent | undefined {
+    if (typeof idOrName !== 'string') return undefined;
+    const bot = db.getAgentById(idOrName) || db.getAgentByName(orgId, idOrName);
+    if (!bot || bot.org_id !== orgId) return undefined;
+    return bot;
+  }
+
+  function requireThreadParticipant(
+    req: import('express').Request,
+    res: import('express').Response,
+    threadId: string,
+  ): Thread | undefined {
+    const thread = db.getThread(threadId);
+    if (!thread) {
+      res.status(404).json({ error: 'Thread not found' });
+      return undefined;
+    }
+
+    if (!req.agent || !db.isParticipant(thread.id, req.agent.id)) {
+      res.status(403).json({ error: 'Not a participant of this thread' });
+      return undefined;
+    }
+
+    return thread;
   }
 
   /**
@@ -451,6 +481,378 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     });
 
     res.json({ ok: true, message: `Channel deleted` });
+  });
+
+  // ─── Threads ─────────────────────────────────────────────
+
+  /**
+   * POST /api/threads — Create a thread
+   * Body: { topic, type?, participants?, channel_id?, context? }
+   */
+  auth.post('/api/threads', requireAgent, (req, res) => {
+    const { topic, type, participants, channel_id, context } = req.body;
+    const orgId = req.agent!.org_id;
+
+    if (!topic || typeof topic !== 'string') {
+      res.status(400).json({ error: 'topic is required' });
+      return;
+    }
+
+    const threadType = (typeof type === 'string' ? type : 'discussion') as ThreadType;
+    if (!THREAD_TYPES.has(threadType)) {
+      res.status(400).json({ error: 'Invalid thread type' });
+      return;
+    }
+
+    if (participants !== undefined && !Array.isArray(participants)) {
+      res.status(400).json({ error: 'participants must be an array' });
+      return;
+    }
+
+    const resolvedParticipantIds: string[] = [];
+    for (const p of (participants || [])) {
+      const bot = resolveAgent(orgId, p);
+      if (!bot) {
+        res.status(400).json({ error: `Agent not found: ${p}` });
+        return;
+      }
+      resolvedParticipantIds.push(bot.id);
+    }
+
+    let resolvedChannelId: string | undefined;
+    if (channel_id !== undefined && channel_id !== null) {
+      if (typeof channel_id !== 'string') {
+        res.status(400).json({ error: 'channel_id must be a string' });
+        return;
+      }
+
+      const channel = db.getChannel(channel_id);
+      if (!channel || channel.org_id !== orgId) {
+        res.status(400).json({ error: 'Invalid channel_id' });
+        return;
+      }
+      resolvedChannelId = channel.id;
+    }
+
+    let contextJson: string | null | undefined;
+    if (context !== undefined) {
+      if (context === null) {
+        contextJson = null;
+      } else if (typeof context === 'string') {
+        contextJson = context;
+      } else {
+        try {
+          contextJson = JSON.stringify(context);
+        } catch {
+          res.status(400).json({ error: 'context must be JSON-serializable' });
+          return;
+        }
+      }
+    }
+
+    try {
+      const thread = db.createThread(
+        orgId,
+        req.agent!.id,
+        topic,
+        threadType,
+        resolvedParticipantIds,
+        resolvedChannelId,
+        contextJson,
+      );
+
+      ws.broadcastThreadEvent(orgId, thread.id, {
+        type: 'thread_created',
+        thread,
+      });
+
+      res.json(thread);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to create thread' });
+    }
+  });
+
+  /**
+   * GET /api/threads — List my threads
+   * Query: status?
+   */
+  auth.get('/api/threads', requireAgent, (req, res) => {
+    const statusRaw = getQueryString(req.query.status);
+    if (statusRaw && !THREAD_STATUSES.has(statusRaw as ThreadStatus)) {
+      res.status(400).json({ error: 'Invalid status filter' });
+      return;
+    }
+
+    const status = statusRaw as ThreadStatus | undefined;
+    const threads = db.listThreadsForAgent(req.agent!.id, status);
+    res.json(threads);
+  });
+
+  /**
+   * GET /api/threads/:id — Thread details with participants
+   */
+  auth.get('/api/threads/:id', requireAgent, (req, res) => {
+    const thread = requireThreadParticipant(req, res, req.params.id as string);
+    if (!thread) return;
+
+    const participants = db.getParticipants(thread.id).map(p => {
+      const bot = db.getAgentById(p.bot_id);
+      return {
+        bot_id: p.bot_id,
+        name: bot?.name,
+        display_name: bot?.display_name,
+        online: bot?.online,
+        label: p.label,
+        joined_at: p.joined_at,
+      };
+    });
+
+    res.json({ ...thread, participants });
+  });
+
+  /**
+   * PATCH /api/threads/:id — Update thread status/context
+   * Body: { status?, close_reason?, context? }
+   */
+  auth.patch('/api/threads/:id', requireAgent, (req, res) => {
+    const thread = requireThreadParticipant(req, res, req.params.id as string);
+    if (!thread) return;
+
+    const { status: statusInput, close_reason, context } = req.body;
+    if (statusInput === undefined && context === undefined && close_reason === undefined) {
+      res.status(400).json({ error: 'No updatable fields provided' });
+      return;
+    }
+
+    let status: ThreadStatus | undefined;
+    if (statusInput !== undefined) {
+      if (typeof statusInput !== 'string' || !THREAD_STATUSES.has(statusInput as ThreadStatus)) {
+        res.status(400).json({ error: 'Invalid status' });
+        return;
+      }
+      status = statusInput as ThreadStatus;
+    }
+
+    let closeReason: CloseReason | undefined;
+    if (close_reason !== undefined) {
+      if (typeof close_reason !== 'string' || !CLOSE_REASONS.has(close_reason as CloseReason)) {
+        res.status(400).json({ error: 'Invalid close_reason' });
+        return;
+      }
+      closeReason = close_reason as CloseReason;
+    }
+
+    if (status === 'closed' && closeReason === undefined) {
+      res.status(400).json({ error: 'close_reason is required for closed status' });
+      return;
+    }
+    if (status !== 'closed' && closeReason !== undefined) {
+      res.status(400).json({ error: 'close_reason is only allowed with closed status' });
+      return;
+    }
+
+    let contextJson: string | null | undefined;
+    if (context !== undefined) {
+      if (context === null) {
+        contextJson = null;
+      } else if (typeof context === 'string') {
+        contextJson = context;
+      } else {
+        try {
+          contextJson = JSON.stringify(context);
+        } catch {
+          res.status(400).json({ error: 'context must be JSON-serializable' });
+          return;
+        }
+      }
+    }
+
+    const changes: string[] = [];
+    let updated: Thread | undefined = thread;
+
+    try {
+      if (status !== undefined) {
+        updated = db.updateThreadStatus(thread.id, status, closeReason);
+        if (!updated) {
+          res.status(404).json({ error: 'Thread not found' });
+          return;
+        }
+        changes.push('status');
+        if (status === 'closed') changes.push('close_reason');
+        if (status === 'resolved') changes.push('resolved_at');
+      }
+
+      if (context !== undefined) {
+        updated = db.updateThreadContext(thread.id, contextJson ?? null);
+        if (!updated) {
+          res.status(404).json({ error: 'Thread not found' });
+          return;
+        }
+        changes.push('context');
+      }
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to update thread' });
+      return;
+    }
+
+    ws.broadcastThreadEvent(thread.org_id, thread.id, {
+      type: 'thread_updated',
+      thread: updated!,
+      changes,
+    });
+
+    res.json(updated);
+  });
+
+  /**
+   * POST /api/threads/:id/participants — Invite bot (id or name)
+   * Body: { bot_id, label? }
+   */
+  auth.post('/api/threads/:id/participants', requireAgent, (req, res) => {
+    const thread = requireThreadParticipant(req, res, req.params.id as string);
+    if (!thread) return;
+
+    const { bot_id, label } = req.body;
+    if (!bot_id || typeof bot_id !== 'string') {
+      res.status(400).json({ error: 'bot_id is required' });
+      return;
+    }
+    if (label !== undefined && label !== null && typeof label !== 'string') {
+      res.status(400).json({ error: 'label must be a string' });
+      return;
+    }
+
+    const bot = resolveAgent(thread.org_id, bot_id);
+    if (!bot) {
+      res.status(404).json({ error: `Agent not found: ${bot_id}` });
+      return;
+    }
+
+    const alreadyParticipant = db.isParticipant(thread.id, bot.id);
+    try {
+      const participant = db.addParticipant(thread.id, bot.id, label);
+
+      if (!alreadyParticipant) {
+        ws.broadcastThreadEvent(thread.org_id, thread.id, {
+          type: 'thread_participant',
+          thread_id: thread.id,
+          bot_id: bot.id,
+          action: 'joined',
+        });
+      }
+
+      res.json(participant);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to add participant' });
+    }
+  });
+
+  /**
+   * DELETE /api/threads/:id/participants/:bot — Leave/remove participant (id or name)
+   */
+  auth.delete('/api/threads/:id/participants/:bot', requireAgent, (req, res) => {
+    const thread = requireThreadParticipant(req, res, req.params.id as string);
+    if (!thread) return;
+
+    const target = resolveAgent(thread.org_id, req.params.bot as string);
+    if (!target) {
+      res.status(404).json({ error: `Agent not found: ${req.params.bot}` });
+      return;
+    }
+
+    if (!db.isParticipant(thread.id, target.id)) {
+      res.status(404).json({ error: 'Bot is not a participant in this thread' });
+      return;
+    }
+
+    const participants = db.getParticipants(thread.id);
+    if (participants.length <= 1) {
+      res.status(400).json({ error: 'Cannot remove the last participant from a thread' });
+      return;
+    }
+
+    db.removeParticipant(thread.id, target.id);
+    ws.broadcastThreadEvent(thread.org_id, thread.id, {
+      type: 'thread_participant',
+      thread_id: thread.id,
+      bot_id: target.id,
+      action: 'left',
+    });
+
+    res.json({ ok: true });
+  });
+
+  /**
+   * POST /api/threads/:id/messages — Send a thread message
+   * Body: { content, content_type?, metadata? }
+   */
+  auth.post('/api/threads/:id/messages', requireAgent, (req, res) => {
+    const thread = requireThreadParticipant(req, res, req.params.id as string);
+    if (!thread) return;
+
+    const { content, content_type, metadata } = req.body;
+    if (!content || typeof content !== 'string') {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+
+    if (content.length > config.max_message_length) {
+      res.status(400).json({ error: `Message too long (max ${config.max_message_length} chars)` });
+      return;
+    }
+
+    let metadataJson: string | null | undefined;
+    if (metadata !== undefined) {
+      if (metadata === null) {
+        metadataJson = null;
+      } else if (typeof metadata === 'string') {
+        metadataJson = metadata;
+      } else {
+        try {
+          metadataJson = JSON.stringify(metadata);
+        } catch {
+          res.status(400).json({ error: 'metadata must be JSON-serializable' });
+          return;
+        }
+      }
+    }
+
+    const message = db.createThreadMessage(
+      thread.id,
+      req.agent!.id,
+      content,
+      typeof content_type === 'string' ? content_type : 'text',
+      metadataJson,
+    );
+
+    ws.broadcastThreadEvent(thread.org_id, thread.id, {
+      type: 'thread_message',
+      thread_id: thread.id,
+      message,
+    });
+
+    res.json(message);
+  });
+
+  /**
+   * GET /api/threads/:id/messages — Get thread messages
+   * Query: limit?, before?
+   */
+  auth.get('/api/threads/:id/messages', requireAgent, (req, res) => {
+    const thread = requireThreadParticipant(req, res, req.params.id as string);
+    if (!thread) return;
+
+    const limit = Math.min(parseInt(getQueryString(req.query.limit) || '') || 50, 200);
+    const beforeStr = getQueryString(req.query.before);
+    const before = beforeStr ? parseInt(beforeStr) : undefined;
+
+    const messages = db.getThreadMessages(thread.id, limit, before);
+    const enriched = messages.map(m => {
+      const sender = db.getAgentById(m.sender_id);
+      return { ...m, sender_name: sender?.name || 'unknown' };
+    });
+
+    res.json(enriched.reverse());
   });
 
   // ─── Messages ─────────────────────────────────────────────

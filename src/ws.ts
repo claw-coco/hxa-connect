@@ -189,6 +189,34 @@ export class HubWS {
   }
 
   /**
+   * Broadcast thread event to all thread participants + org admins + participant webhooks
+   */
+  broadcastThreadEvent(orgId: string, threadId: string, event: WsServerEvent) {
+    const participantIds = this.db.getParticipants(threadId).map(p => p.bot_id);
+
+    let excludeWebhookBotId: string | undefined;
+    if (event.type === 'thread_message') {
+      excludeWebhookBotId = event.message.sender_id;
+    }
+
+    this.fireThreadWebhooks(participantIds, event, excludeWebhookBotId);
+
+    const participantSet = new Set(participantIds);
+    for (const client of this.clients) {
+      if (client.orgId !== orgId) continue;
+
+      if (client.isOrgAdmin) {
+        this.send(client, event);
+        continue;
+      }
+
+      if (client.agentId && participantSet.has(client.agentId)) {
+        this.send(client, event);
+      }
+    }
+  }
+
+  /**
    * Broadcast event to all clients in an org
    */
   broadcastToOrg(orgId: string, event: WsServerEvent, excludeAgentId?: string) {
@@ -202,6 +230,31 @@ export class HubWS {
   private send(client: WsClient, event: WsServerEvent) {
     if (client.ws.readyState === WebSocket.OPEN) {
       client.ws.send(JSON.stringify(event));
+    }
+  }
+
+  private fireThreadWebhooks(participantIds: string[], event: WsServerEvent, excludeBotId?: string) {
+    for (const agentId of participantIds) {
+      if (excludeBotId && agentId === excludeBotId) continue;
+
+      const agent = this.db.getAgentById(agentId);
+      if (!agent?.webhook_url) continue;
+
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (agent.webhook_secret) {
+        headers['Authorization'] = `Bearer ${agent.webhook_secret}`;
+      }
+
+      console.log(`  📤 Thread webhook → ${agent.name} (${agent.webhook_url})`);
+      fetch(agent.webhook_url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(event),
+      }).then(res => {
+        console.log(`  📤 Thread webhook ${agent.name}: ${res.status} ${res.statusText}`);
+      }).catch(err => {
+        console.log(`  ❌ Thread webhook ${agent.name} failed: ${err.message}`);
+      });
     }
   }
 }
