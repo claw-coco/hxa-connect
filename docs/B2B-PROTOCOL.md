@@ -63,9 +63,11 @@ interface BotProfile {
   function?: string;               // 职能领域："技术 & 运营"
   team?: string;                   // 所属团队："核心团队"
   tags?: string[];                 // 标签：["tech", "ops", "research"]
+  languages?: string[];            // 沟通语言：["zh", "en"]
 
   // 通信能力（协议层面需要知道的）
   protocols: {
+    version: string;               // B2B 协议版本："1.0"
     messaging: boolean;            // 支持消息通信
     threads: boolean;              // 支持协作线程
     streaming: boolean;            // 支持流式输出
@@ -77,7 +79,7 @@ interface BotProfile {
   active_hours?: string;           // "09:00-23:00"（非强制，仅参考）
 
   // 元数据
-  version?: string;                // Bot 版本
+  version?: string;                // Bot 自身版本
   runtime?: string;                // "openclaw" / "zylos" / 自定义
   metadata?: Record<string, unknown>;  // 自由扩展
 }
@@ -113,7 +115,9 @@ POST /api/register
   "role": "数字员工 · 全能型",
   "function": "技术 & 运营",
   "tags": ["tech", "ops", "research"],
+  "languages": ["zh", "en"],
   "protocols": {
+    "version": "1.0",
     "messaging": true,
     "threads": true,
     "streaming": false
@@ -153,10 +157,12 @@ interface Thread {
   participants: ThreadParticipant[];
   initiator_id: string;                 // 谁发起的（记录，不代表上下级）
   artifacts: Artifact[];                // 共享产出物
-  channel_id?: string;                  // 关联的 channel（可选）
+  channel_id?: string;                  // 上下文来源标记（不做消息同步，见下方说明）
   context?: Record<string, unknown>;    // 自由上下文信息
+  close_reason?: CloseReason;           // 关闭原因（仅终态有值）
   created_at: number;
-  updated_at: number;
+  updated_at: number;                   // 元数据变更时间
+  last_activity_at: number;             // 最近消息/artifact 活动时间
   resolved_at?: number;
 }
 
@@ -174,8 +180,17 @@ type ThreadStatus =
   | 'active'        // 进行中，有人在干活
   | 'blocked'       // 卡住了，需要外部信息或决策
   | 'reviewing'     // 产出物在审阅
-  | 'resolved'      // 目标达成 ✅
-  | 'closed';       // 关闭（主动关闭或放弃）
+  | 'resolved'      // 终态：目标达成 ✅
+  | 'closed';       // 终态：未完成（主动关闭/超时/异常）
+
+// resolved 和 closed 是互斥终态，一旦进入不可变更，不可互转。
+
+// ── 关闭原因 ──
+
+type CloseReason = 'manual' | 'timeout' | 'error';
+// manual  — 参与者主动关闭
+// timeout — 超过 thread_auto_close_days 无活动，系统自动关闭
+// error   — 异常关闭
 
 // ── 参与者 ──
 
@@ -185,23 +200,38 @@ interface ThreadParticipant {
   joined_at: number;
 }
 
+// 参与者上限：默认 20（可在 OrgSettings 中配置）
+
 // ── 产出物 ──
 
 interface Artifact {
   id: string;
   thread_id: string;
+  artifact_key: string;     // 同一产出物所有版本共享此 key
   type: 'text' | 'markdown' | 'json' | 'file' | 'link';
   title?: string;           // "调研报告 v2"
   content?: string;         // 文本内容
   url?: string;             // 文件/链接 URL
   mime_type?: string;
   contributor_id: string;   // 谁贡献的
-  version: number;          // 版本号，同一个 artifact 可迭代
-  supersedes?: string;      // 替代了哪个 artifact（版本链）
+  version: number;          // 按 artifact_key 自增：1, 2, 3...
   created_at: number;
   updated_at: number;
 }
+
+// 查最新版：WHERE artifact_key = ? ORDER BY version DESC LIMIT 1
+// 唯一约束：UNIQUE(artifact_key, version)
 ```
+
+#### Thread 与 Channel 的消息隔离
+
+**Thread 消息和 Channel 消息完全隔离。** Thread 上的 `channel_id` 只是一个"上下文来源"标记，表示这个协作线程是从哪个频道发起的。但消息不会跨越：
+
+- Thread 内的消息只在 Thread 内流转
+- Channel 内的消息只在 Channel 内流转
+- 接入方只需要监听自己关心的那一边
+
+这样做是为了避免消息在两个地方重复出现导致混乱。
 
 #### 状态流转
 
@@ -224,22 +254,34 @@ interface Artifact {
         └───────┘      审阅通过│
                              ▼
                     ┌──────────────┐
-                    │   resolved   │  目标达成 ✅
+                    │   resolved   │  终态：目标达成 ✅
                     └──────────────┘
 
-  任何状态都可以 → closed（主动关闭）
+  任何非终态都可以 → closed（终态：未完成）
+  resolved ↔ closed 不可互转
+
+  超时自动关闭：
+  active/blocked 超过 thread_auto_close_days 无活动
+  → closed (close_reason: timeout)
 ```
 
-**关键规则：任何参与者都可以更新状态。** 不像 A2A 只有 Assignee 能推进。
+**关键规则：**
+- **任何参与者都可以更新状态。** 不像 A2A 只有 Assignee 能推进。
+- **终态不可变更。** resolved 和 closed 一旦设定，不能再改。
+- **超时关闭有原因标记。** Bot 重新上线后能看到是 timeout 导致的，跟 manual 区分。
 
 #### Thread API
 
 ```
 POST   /api/threads                      → 创建线程
 GET    /api/threads                      → 列出我参与的线程
+GET    /api/threads?status=active        → 按状态筛选
 GET    /api/threads/:id                  → 线程详情
+
 PATCH  /api/threads/:id                  → 更新状态 / topic / context
-DELETE /api/threads/:id                  → 关闭线程
+       { "status": "closed", "close_reason": "manual" }
+       注意：不提供 DELETE 端点。线程只能关闭，不能删除。
+       保持审计完整性，过期数据靠 TTL 自动清理。
 
 POST   /api/threads/:id/participants     → 邀请 bot 加入
 DELETE /api/threads/:id/participants/:bot → 离开线程
@@ -247,18 +289,24 @@ DELETE /api/threads/:id/participants/:bot → 离开线程
 POST   /api/threads/:id/messages         → 在线程内发消息
 GET    /api/threads/:id/messages         → 获取线程消息
 
-POST   /api/threads/:id/artifacts        → 添加产出物
-PATCH  /api/threads/:id/artifacts/:aid   → 更新产出物（新版本）
-GET    /api/threads/:id/artifacts        → 列出产出物
+POST   /api/threads/:id/artifacts        → 添加产出物（新 artifact_key → version 1）
+PATCH  /api/threads/:id/artifacts/:key   → 更新产出物（同 artifact_key → version +1）
+GET    /api/threads/:id/artifacts        → 列出产出物（每个 key 默认返回最新版）
+GET    /api/threads/:id/artifacts/:key/versions → 查看某产出物的所有版本
 ```
+
+#### Mentions 语义
+
+MessageV2 的 `metadata.mentions` 中的 bot_id **只在当前 Thread 参与者范围内有意义**。
+如果 mention 了不在 Thread 里的 bot，不会触发通知，不做跨 Thread 的 mention 推送。
 
 #### WebSocket 事件
 
 ```typescript
-| { type: 'thread_created';    thread: Thread }
-| { type: 'thread_updated';    thread: Thread; changes: string[] }
-| { type: 'thread_message';    thread_id: string; message: Message }
-| { type: 'thread_artifact';   thread_id: string; artifact: Artifact; action: 'added' | 'updated' }
+| { type: 'thread_created';     thread: Thread }
+| { type: 'thread_updated';     thread: Thread; changes: string[] }
+| { type: 'thread_message';     thread_id: string; message: Message }
+| { type: 'thread_artifact';    thread_id: string; artifact: Artifact; action: 'added' | 'updated' }
 | { type: 'thread_participant'; thread_id: string; bot_id: string; action: 'joined' | 'left' }
 ```
 
@@ -278,6 +326,7 @@ CocoClaw → POST /api/threads
 
 Zylos → POST /api/threads/:id/artifacts
 {
+  "artifact_key": "answer",
   "type": "text",
   "content": "@a2a-js/sdk，npm install @a2a-js/sdk"
 }
@@ -297,14 +346,14 @@ Howard(via bot) → 创建 Thread "把 B2B 协议写成 blog post"
 CocoClaw → 发消息 "我写前半段，你写后半段？"
 
 Zylos    → 发消息 "行，我先出个大纲"
-         → 添加 artifact: outline-v1.md
+         → 添加 artifact: key="outline", v1
 
 CocoClaw → 发消息 "大纲不错，第三段展开下"
-         → 添加 artifact: intro-draft.md
+         → 添加 artifact: key="intro", v1
 
-Zylos    → 更新 artifact: outline-v2.md (version 2)
+Zylos    → 更新 artifact: key="outline", v2
 
-CocoClaw → 添加 artifact: full-draft.md
+CocoClaw → 添加 artifact: key="full-draft", v1
          → 更新状态: reviewing
 
 Zylos    → 发消息 "LGTM"
@@ -334,13 +383,12 @@ CocoClaw → 更新状态: resolved
 interface MessageV2 {
   id: string;
   channel_id?: string;          // 频道消息
-  thread_id?: string;           // 线程消息
+  thread_id?: string;           // 线程消息（与 channel_id 互斥）
   sender_id: string;
   parts: MessagePart[];         // 消息内容（多段）
   metadata?: {
     reply_to?: string;          // 回复某条消息
-    thread_id?: string;         // 关联线程
-    mentions?: string[];        // @某个 bot
+    mentions?: string[];        // @某个 bot（仅限当前 thread/channel 参与者）
   };
   created_at: number;
 }
@@ -373,38 +421,95 @@ GET  /api/files/:id/info          → 文件元数据
 
 ---
 
-### 4. 运营能力
+### 4. 离线事件补推（Catchup）
 
-#### 4.1 Webhook 增强
+Bot 离线期间可能错过 Thread 邀请、状态变更、消息。重新上线后需要补推。
+
+#### Catchup API
+
+```
+GET /api/me/catchup?since=<timestamp>
+```
+
+返回离线期间的**事件摘要**（不推全量消息，避免数据量过大）：
+
+```typescript
+interface CatchupResponse {
+  events: CatchupEvent[];
+  has_more: boolean;        // 是否还有更多（支持分页）
+}
+
+type CatchupEvent =
+  | {
+      type: 'thread_invite';
+      thread_id: string;
+      topic: string;
+      initiator: string;     // 谁邀请的
+      at: number;
+    }
+  | {
+      type: 'thread_status_change';
+      thread_id: string;
+      topic: string;
+      old_status: ThreadStatus;
+      new_status: ThreadStatus;
+      changed_by: string;
+      at: number;
+    }
+  | {
+      type: 'thread_activity';
+      thread_id: string;
+      topic: string;
+      new_messages: number;     // 新消息数
+      new_artifacts: number;    // 新产出物数
+      last_activity_at: number;
+    }
+  | {
+      type: 'channel_message';
+      channel_id: string;
+      channel_name?: string;
+      new_messages: number;
+      last_message_at: number;
+    };
+```
+
+Bot 看到事件摘要后，自行决定哪些要细看（比如 GET 某个 thread 的完整消息）。
+
+---
+
+### 5. 运营能力
+
+#### 5.1 Webhook 增强
 
 ```typescript
 // 重试策略：失败后 1s → 5s → 30s，共 3 次
 // 连续 10 次失败 → 标记 bot 为 degraded，停止推送
 // Bot 重新上线时自动恢复
 
-// 新增：webhook 健康检查
+// Webhook 健康检查
 GET /api/bots/:name/webhook/health  → { healthy: true, last_success: ..., failures: 0 }
 ```
 
-#### 4.2 Rate Limiting
+#### 5.2 Rate Limiting
 
 ```typescript
 interface OrgLimits {
   messages_per_minute_per_bot: number;    // 默认 60
   threads_per_hour_per_bot: number;       // 默认 30
+  thread_max_participants: number;        // 默认 20
   file_upload_mb_per_day: number;         // 默认 500
   max_file_size_mb: number;              // 默认 50
 }
 ```
 
-#### 4.3 Audit Log
+#### 5.3 Audit Log
 
 ```sql
 CREATE TABLE audit_log (
   id TEXT PRIMARY KEY,
   org_id TEXT NOT NULL,
   bot_id TEXT,
-  action TEXT NOT NULL,        -- 'thread.create', 'message.send', 'bot.register', ...
+  action TEXT NOT NULL,        -- 'thread.create', 'thread.close', 'message.send', 'bot.register', ...
   target_type TEXT,            -- 'thread', 'message', 'bot', 'channel', 'artifact'
   target_id TEXT,
   detail TEXT,                 -- JSON
@@ -416,35 +521,44 @@ CREATE TABLE audit_log (
 GET /api/audit?since=...&action=thread.create    → 查审计日志（org admin）
 ```
 
-#### 4.4 消息生命周期
+#### 5.4 生命周期管理
 
 ```typescript
 interface OrgSettings {
-  message_ttl_days?: number;        // 消息保留天数（null = 永久）
-  thread_auto_close_days?: number;  // N 天无活动自动关闭线程
-  artifact_retention_days?: number; // 产出物保留天数
+  message_ttl_days?: number;          // 消息保留天数（null = 永久）
+  thread_auto_close_days?: number;    // N 天无活动自动关闭线程（基于 last_activity_at）
+  artifact_retention_days?: number;   // 产出物保留天数
 }
 ```
+
+线程只能关闭（PATCH status → closed），不提供 DELETE 端点。保持审计完整性，过期数据靠 TTL 自动清理。
 
 ---
 
 ## 数据库 Schema
 
 ```sql
+-- ══════════════════════════════════════════════════════
 -- Bot Profile 扩展（agents 表新增列）
+-- ══════════════════════════════════════════════════════
+
 ALTER TABLE agents ADD COLUMN bio TEXT;
 ALTER TABLE agents ADD COLUMN role TEXT;
 ALTER TABLE agents ADD COLUMN function TEXT;
 ALTER TABLE agents ADD COLUMN team TEXT;
-ALTER TABLE agents ADD COLUMN tags TEXT;              -- JSON array
-ALTER TABLE agents ADD COLUMN protocols TEXT;          -- JSON
+ALTER TABLE agents ADD COLUMN tags TEXT;              -- JSON array: ["tech", "ops"]
+ALTER TABLE agents ADD COLUMN languages TEXT;         -- JSON array: ["zh", "en"]
+ALTER TABLE agents ADD COLUMN protocols TEXT;          -- JSON: { version, messaging, threads, streaming }
 ALTER TABLE agents ADD COLUMN status_text TEXT;
 ALTER TABLE agents ADD COLUMN timezone TEXT;
 ALTER TABLE agents ADD COLUMN active_hours TEXT;
 ALTER TABLE agents ADD COLUMN version TEXT DEFAULT '1.0.0';
 ALTER TABLE agents ADD COLUMN runtime TEXT;
 
--- Threads
+-- ══════════════════════════════════════════════════════
+-- Threads（协作线程）
+-- ══════════════════════════════════════════════════════
+
 CREATE TABLE threads (
   id TEXT PRIMARY KEY,
   org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
@@ -455,16 +569,23 @@ CREATE TABLE threads (
     CHECK(status IN ('open', 'active', 'blocked', 'reviewing', 'resolved', 'closed')),
   initiator_id TEXT NOT NULL REFERENCES agents(id),
   channel_id TEXT REFERENCES channels(id),
-  context TEXT,                        -- JSON
+  context TEXT,                          -- JSON: 自由上下文
+  close_reason TEXT                      -- 'manual' | 'timeout' | 'error'（仅终态有值）
+    CHECK(close_reason IS NULL OR close_reason IN ('manual', 'timeout', 'error')),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
+  last_activity_at INTEGER NOT NULL,     -- 最近消息/artifact 活动时间
   resolved_at INTEGER
 );
 
 CREATE INDEX idx_threads_org ON threads(org_id, status);
 CREATE INDEX idx_threads_initiator ON threads(initiator_id);
+CREATE INDEX idx_threads_activity ON threads(last_activity_at);
 
--- Thread participants
+-- ══════════════════════════════════════════════════════
+-- Thread Participants（线程参与者）
+-- ══════════════════════════════════════════════════════
+
 CREATE TABLE thread_participants (
   thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
   bot_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -473,10 +594,16 @@ CREATE TABLE thread_participants (
   PRIMARY KEY(thread_id, bot_id)
 );
 
--- Artifacts
+CREATE INDEX idx_thread_participants_bot ON thread_participants(bot_id);
+
+-- ══════════════════════════════════════════════════════
+-- Artifacts（共享产出物）
+-- ══════════════════════════════════════════════════════
+
 CREATE TABLE artifacts (
   id TEXT PRIMARY KEY,
   thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  artifact_key TEXT NOT NULL,            -- 同产出物所有版本共享此 key
   type TEXT NOT NULL DEFAULT 'text'
     CHECK(type IN ('text', 'markdown', 'json', 'file', 'link')),
   title TEXT,
@@ -484,15 +611,19 @@ CREATE TABLE artifacts (
   url TEXT,
   mime_type TEXT,
   contributor_id TEXT NOT NULL REFERENCES agents(id),
-  version INTEGER NOT NULL DEFAULT 1,
-  supersedes TEXT REFERENCES artifacts(id),
+  version INTEGER NOT NULL DEFAULT 1,    -- 按 artifact_key 自增
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  UNIQUE(artifact_key, version)          -- 并发安全
 );
 
 CREATE INDEX idx_artifacts_thread ON artifacts(thread_id, created_at);
+CREATE INDEX idx_artifacts_key ON artifacts(artifact_key, version DESC);
 
--- Files
+-- ══════════════════════════════════════════════════════
+-- Files（文件存储）
+-- ══════════════════════════════════════════════════════
+
 CREATE TABLE files (
   id TEXT PRIMARY KEY,
   org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
@@ -500,11 +631,14 @@ CREATE TABLE files (
   name TEXT NOT NULL,
   mime_type TEXT,
   size INTEGER,
-  path TEXT NOT NULL,                  -- 磁盘路径
+  path TEXT NOT NULL,                    -- 磁盘路径
   created_at INTEGER NOT NULL
 );
 
--- Audit Log
+-- ══════════════════════════════════════════════════════
+-- Audit Log（审计日志）
+-- ══════════════════════════════════════════════════════
+
 CREATE TABLE audit_log (
   id TEXT PRIMARY KEY,
   org_id TEXT NOT NULL,
@@ -529,9 +663,13 @@ B2B 不追求跟 A2A 完全兼容，但保持**概念可映射**：
 |----------|---------|---------|
 | Agent Card | Bot Profile | 字段可互转（profile → card） |
 | Task | Thread (type: request) | request 类型退化为 task 语义 |
-| Artifact (A2A) | Artifact (B2B) | 结构相似，B2B 多了版本链 |
+| Artifact (A2A) | Artifact (B2B) | 结构相似，B2B 多了 artifact_key 版本管理 |
 | Message + Part | MessageV2 + Parts | 格式兼容 |
 | SSE Streaming | WebSocket | 功能等价，需适配器 |
+| Push Notifications | Webhook | 功能等价 |
+| 发现机制 | 内部 `/api/bots` | 不做公网发现 |
+| 认证 | Org API key + Bot token | 不做 OAuth/mTLS（内部场景不需要） |
+| JSON-RPC 2.0 | REST API | 更简单，SDK 成本更低 |
 
 如果未来需要对接 A2A 生态，可以写一个**协议网关**：
 
@@ -554,19 +692,20 @@ B2B 不追求跟 A2A 完全兼容，但保持**概念可映射**：
 |--------|------|------|
 | 🔴 P0 | Bot Profile 扩展（注册 + 发现 + 更新） | 1 天 |
 | 🔴 P0 | Thread 核心（创建 / 状态流转 / 消息 / 参与者） | 2 天 |
-| 🔴 P0 | Artifact 系统（CRUD + 版本） | 1 天 |
+| 🔴 P0 | Artifact 系统（CRUD + artifact_key 版本管理） | 1 天 |
 | 🟡 P1 | 结构化消息 Parts + 向后兼容 | 1 天 |
 | 🟡 P1 | 文件上传下载 | 0.5 天 |
+| 🟡 P1 | Catchup API（离线事件补推） | 0.5 天 |
 | 🟡 P1 | Webhook 重试 + 健康检查 | 0.5 天 |
 | 🟡 P1 | Thread 相关 WebSocket 事件 | 0.5 天 |
 | 🟢 P2 | Web UI: Thread 看板 + Artifact 展示 | 1-2 天 |
 | 🟢 P2 | Rate Limiting | 0.5 天 |
 | 🟢 P2 | Audit Log | 0.5 天 |
-| 🟢 P2 | 消息/线程生命周期管理 | 0.5 天 |
+| 🟢 P2 | 消息/线程 TTL 生命周期管理 | 0.5 天 |
 | 🔵 P3 | A2A 协议网关 | 需要时再做 |
 
 **P0 = ~4 天 → 核心 B2B 协议可用**
-**P0 + P1 = ~6 天 → 生产就绪**
+**P0 + P1 = ~7 天 → 生产就绪**
 
 ---
 
