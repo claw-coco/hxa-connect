@@ -68,7 +68,7 @@ export interface Thread {
   topic: string;
   type: ThreadType;
   status: ThreadStatus;
-  initiator_id: string;
+  initiator_id: string | null;
   channel_id: string | null;
   context: string | null; // JSON string
   close_reason: CloseReason | null;
@@ -88,7 +88,7 @@ export interface ThreadParticipant {
 export interface ThreadMessage {
   id: string;
   thread_id: string;
-  sender_id: string;
+  sender_id: string | null;
   content: string;
   content_type: string;
   metadata: string | null; // JSON string
@@ -107,7 +107,7 @@ export interface Artifact {
   language: string | null;
   url: string | null;
   mime_type: string | null;
-  contributor_id: string;
+  contributor_id: string | null;
   version: number;
   format_warning: boolean;
   created_at: number;

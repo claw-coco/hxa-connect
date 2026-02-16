@@ -850,7 +850,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
     const messages = db.getThreadMessages(thread.id, limit, before);
     const enriched = messages.map(m => {
-      const sender = db.getAgentById(m.sender_id);
+      const sender = m.sender_id ? db.getAgentById(m.sender_id) : undefined;
       return { ...m, sender_name: sender?.name || 'unknown' };
     });
 
@@ -1074,7 +1074,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
     // Enrich with sender names
     const enriched = messages.map(m => {
-      const sender = db.getAgentById(m.sender_id);
+      const sender = m.sender_id ? db.getAgentById(m.sender_id) : undefined;
       return { ...m, sender_name: sender?.name || 'unknown' };
     });
 
@@ -1143,7 +1143,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
     const messages = db.getNewMessages(req.agent!.id, since);
     const enriched = messages.map(m => {
-      const sender = db.getAgentById(m.sender_id);
+      const sender = m.sender_id ? db.getAgentById(m.sender_id) : undefined;
       return { ...m, sender_name: sender?.name || 'unknown' };
     });
 

@@ -93,8 +93,8 @@ export class HubDB {
           CHECK(type IN ('discussion', 'request', 'collab')),
         status TEXT NOT NULL DEFAULT 'open'
           CHECK(status IN ('open', 'active', 'blocked', 'reviewing', 'resolved', 'closed')),
-        initiator_id TEXT NOT NULL REFERENCES agents(id),
-        channel_id TEXT REFERENCES channels(id),
+        initiator_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+        channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
         context TEXT,
         close_reason TEXT
           CHECK(close_reason IS NULL OR close_reason IN ('manual', 'timeout', 'error')),
@@ -115,7 +115,7 @@ export class HubDB {
       CREATE TABLE IF NOT EXISTS thread_messages (
         id TEXT PRIMARY KEY,
         thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-        sender_id TEXT NOT NULL REFERENCES agents(id),
+        sender_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
         content TEXT NOT NULL,
         content_type TEXT DEFAULT 'text',
         metadata TEXT,
@@ -133,7 +133,7 @@ export class HubDB {
         language TEXT,
         url TEXT,
         mime_type TEXT,
-        contributor_id TEXT NOT NULL REFERENCES agents(id),
+        contributor_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
         version INTEGER NOT NULL DEFAULT 1,
         format_warning INTEGER DEFAULT 0,
         created_at INTEGER NOT NULL,
@@ -224,6 +224,10 @@ export class HubDB {
 
     this.db.prepare(`UPDATE agents SET version = '1.0.0' WHERE version IS NULL OR version = ''`).run();
 
+    // Migration: fix FK constraints on threads/thread_messages/artifacts
+    // SQLite cannot ALTER FK constraints, so we must recreate tables.
+    this.migrateThreadForeignKeys();
+
     // Generate admin_secret for orgs that don't have one
     const orgsWithoutSecret = this.db.prepare('SELECT id FROM orgs WHERE admin_secret IS NULL').all() as any[];
     for (const org of orgsWithoutSecret) {
@@ -231,6 +235,89 @@ export class HubDB {
       this.db.prepare('UPDATE orgs SET admin_secret = ? WHERE id = ?').run(secret, org.id);
       console.log(`  🔐 Generated admin_secret for org ${org.id}`);
     }
+  }
+
+  private migrateThreadForeignKeys() {
+    // Check if threads table has the old NOT NULL initiator_id without ON DELETE SET NULL.
+    // We detect this by checking the table schema via pragma.
+    const threadsInfo = this.db.pragma('table_info(threads)') as any[];
+    if (threadsInfo.length === 0) return; // table doesn't exist yet (fresh install)
+
+    const initiatorCol = threadsInfo.find((c: any) => c.name === 'initiator_id');
+    if (!initiatorCol || initiatorCol.notnull === 0) return; // already nullable = already migrated
+
+    console.log('  🔧 Migrating thread tables for FK constraint fixes...');
+
+    this.db.exec(`
+      -- threads: initiator_id NOT NULL → nullable, ON DELETE SET NULL; channel_id ON DELETE SET NULL
+      CREATE TABLE threads_new (
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+        topic TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'discussion'
+          CHECK(type IN ('discussion', 'request', 'collab')),
+        status TEXT NOT NULL DEFAULT 'open'
+          CHECK(status IN ('open', 'active', 'blocked', 'reviewing', 'resolved', 'closed')),
+        initiator_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+        channel_id TEXT REFERENCES channels(id) ON DELETE SET NULL,
+        context TEXT,
+        close_reason TEXT
+          CHECK(close_reason IS NULL OR close_reason IN ('manual', 'timeout', 'error')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        last_activity_at INTEGER NOT NULL,
+        resolved_at INTEGER
+      );
+      INSERT INTO threads_new SELECT * FROM threads;
+      DROP TABLE threads;
+      ALTER TABLE threads_new RENAME TO threads;
+
+      -- thread_messages: sender_id NOT NULL → nullable, ON DELETE SET NULL
+      CREATE TABLE thread_messages_new (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        sender_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+        content TEXT NOT NULL,
+        content_type TEXT DEFAULT 'text',
+        metadata TEXT,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO thread_messages_new SELECT * FROM thread_messages;
+      DROP TABLE thread_messages;
+      ALTER TABLE thread_messages_new RENAME TO thread_messages;
+
+      -- artifacts: contributor_id NOT NULL → nullable, ON DELETE SET NULL
+      CREATE TABLE artifacts_new (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        artifact_key TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'text'
+          CHECK(type IN ('text', 'markdown', 'json', 'code', 'file', 'link')),
+        title TEXT,
+        content TEXT,
+        language TEXT,
+        url TEXT,
+        mime_type TEXT,
+        contributor_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        format_warning INTEGER DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(thread_id, artifact_key, version)
+      );
+      INSERT INTO artifacts_new SELECT * FROM artifacts;
+      DROP TABLE artifacts;
+      ALTER TABLE artifacts_new RENAME TO artifacts;
+
+      -- Recreate indexes (dropped with old tables)
+      CREATE INDEX IF NOT EXISTS idx_threads_org ON threads(org_id, status);
+      CREATE INDEX IF NOT EXISTS idx_threads_initiator ON threads(initiator_id);
+      CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_activity_at);
+      CREATE INDEX IF NOT EXISTS idx_thread_messages ON thread_messages(thread_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id, created_at);
+    `);
+
+    console.log('  ✅ Thread FK migration complete');
   }
 
   private rowToOrg(row: any): Org {
@@ -262,6 +349,7 @@ export class HubDB {
   private rowToThread(row: any): Thread {
     return {
       ...row,
+      initiator_id: row.initiator_id ?? null,
       channel_id: row.channel_id ?? null,
       context: row.context ?? null,
       close_reason: row.close_reason ?? null,
@@ -272,6 +360,7 @@ export class HubDB {
   private rowToThreadMessage(row: any): ThreadMessage {
     return {
       ...row,
+      sender_id: row.sender_id ?? null,
       content_type: row.content_type ?? 'text',
       metadata: row.metadata ?? null,
     };

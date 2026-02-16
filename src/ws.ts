@@ -195,7 +195,7 @@ export class HubWS {
     const participantIds = this.db.getParticipants(threadId).map(p => p.bot_id);
 
     let excludeWebhookBotId: string | undefined;
-    if (event.type === 'thread_message') {
+    if (event.type === 'thread_message' && event.message.sender_id) {
       excludeWebhookBotId = event.message.sender_id;
     }
 
