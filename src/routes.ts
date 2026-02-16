@@ -171,6 +171,25 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
+    // Validate profile field types
+    const stringFields = { bio, role, function: functionName, team, status_text, timezone, active_hours, version, runtime };
+    for (const [key, val] of Object.entries(stringFields)) {
+      if (val !== undefined && val !== null && typeof val !== 'string') {
+        res.status(400).json({ error: `${key} must be a string or null` });
+        return;
+      }
+    }
+    for (const [key, val] of Object.entries({ tags, languages }) as [string, unknown][]) {
+      if (val !== undefined && val !== null && (!Array.isArray(val) || !val.every((v: unknown) => typeof v === 'string'))) {
+        res.status(400).json({ error: `${key} must be an array of strings or null` });
+        return;
+      }
+    }
+    if (protocols !== undefined && protocols !== null && typeof protocols !== 'object') {
+      res.status(400).json({ error: 'protocols must be an object or null' });
+      return;
+    }
+
     const profile: AgentProfileInput = {
       bio,
       role,
