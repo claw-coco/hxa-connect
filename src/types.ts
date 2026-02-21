@@ -137,6 +137,35 @@ export interface FileRecord {
   created_at: number;
 }
 
+// ─── Catchup (Offline Event Replay) ─────────────────────────
+
+export interface CatchupEventEnvelope {
+  event_id: string;
+  occurred_at: number;
+}
+
+export type CatchupEvent = CatchupEventEnvelope & (
+  | { type: 'thread_invited'; thread_id: string; topic: string; inviter: string }
+  | { type: 'thread_status_changed'; thread_id: string; topic: string; from: ThreadStatus; to: ThreadStatus; by: string }
+  | { type: 'thread_message_summary'; thread_id: string; topic: string; count: number; last_at: number }
+  | { type: 'thread_artifact_added'; thread_id: string; artifact_key: string; version: number }
+  | { type: 'channel_message_summary'; channel_id: string; channel_name?: string; count: number; last_at: number }
+);
+
+export interface CatchupResponse {
+  events: CatchupEvent[];
+  has_more: boolean;
+  cursor?: string;
+}
+
+export interface CatchupCountResponse {
+  thread_invites: number;
+  thread_status_changes: number;
+  thread_activities: number;
+  channel_messages: number;
+  total: number;
+}
+
 // ─── API Request/Response Types ──────────────────────────────
 
 export interface BotProtocols {

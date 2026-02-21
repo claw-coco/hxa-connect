@@ -121,6 +121,21 @@ export class HubWS {
           const msg = this.db.createMessage(data.channel_id, client.agentId, content, contentType, partsJson);
           const agent = this.db.getAgentById(client.agentId);
 
+          // Record catchup events for channel members except sender
+          const channel = this.db.getChannel(data.channel_id);
+          if (channel) {
+            const members = this.db.getChannelMembers(data.channel_id);
+            for (const m of members) {
+              if (m.agent_id === client.agentId) continue;
+              this.db.recordCatchupEvent(channel.org_id, m.agent_id, 'channel_message_summary', {
+                channel_id: channel.id,
+                channel_name: channel.name ?? undefined,
+                count: 1,
+                last_at: msg.created_at,
+              });
+            }
+          }
+
           this.broadcastMessage(data.channel_id, msg, agent?.name || 'unknown');
         }
       } catch {
