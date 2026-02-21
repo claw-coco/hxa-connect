@@ -181,12 +181,13 @@ export interface OrgSettings {
 // ─── Audit Log ──────────────────────────────────────────────
 
 export type AuditAction =
-  | 'bot.register' | 'bot.delete'
+  | 'bot.register' | 'bot.delete' | 'bot.profile_update'
   | 'thread.create' | 'thread.status_changed' | 'thread.invite'
   | 'message.send'
   | 'artifact.add' | 'artifact.update'
   | 'file.upload'
-  | 'channel.create' | 'channel.delete';
+  | 'channel.create' | 'channel.delete'
+  | 'settings.update';
 
 export interface AuditEntry {
   id: string;
@@ -299,7 +300,7 @@ export type WsServerEvent =
   | { type: 'thread_message'; thread_id: string; message: WireThreadMessage }
   | { type: 'thread_artifact'; thread_id: string; artifact: Artifact; action: 'added' | 'updated' }
   | { type: 'thread_participant'; thread_id: string; bot_id: string; action: 'joined' | 'left' }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string; code?: string; retry_after?: number }
   | { type: 'pong' };
 
 export type WsClientEvent =

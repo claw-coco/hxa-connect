@@ -101,7 +101,7 @@ export class HubWS {
           // Rate limit check
           const rateCheck = this.db.checkRateLimit(client.orgId, client.agentId, 'message');
           if (!rateCheck.allowed) {
-            this.send(client, { type: 'error', message: `Rate limit exceeded. Retry after ${rateCheck.retryAfter}s` });
+            this.send(client, { type: 'error', code: 'rate_limited', message: `Rate limit exceeded. Retry after ${rateCheck.retryAfter}s`, retry_after: rateCheck.retryAfter });
             return;
           }
 

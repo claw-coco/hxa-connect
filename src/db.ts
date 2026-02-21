@@ -1978,10 +1978,10 @@ export class HubDB {
       ) AND created_at < ?
     `).run(orgId, cutoff);
 
-    // Delete thread messages older than TTL
+    // Delete thread messages older than TTL (only in resolved/closed threads to preserve active context)
     this.db.prepare(`
       DELETE FROM thread_messages WHERE thread_id IN (
-        SELECT id FROM threads WHERE org_id = ?
+        SELECT id FROM threads WHERE org_id = ? AND status IN ('resolved', 'closed')
       ) AND created_at < ?
     `).run(orgId, cutoff);
   }
@@ -1990,9 +1990,9 @@ export class HubDB {
     const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
     const now = Date.now();
     this.db.prepare(`
-      UPDATE threads SET status = 'closed', close_reason = 'timeout', updated_at = ?, last_activity_at = ?
+      UPDATE threads SET status = 'closed', close_reason = 'timeout', updated_at = ?
       WHERE org_id = ? AND last_activity_at < ? AND status NOT IN ('resolved', 'closed')
-    `).run(now, now, orgId, cutoff);
+    `).run(now, orgId, cutoff);
   }
 
   cleanupExpiredArtifacts(orgId: string, days: number): void {

@@ -473,6 +473,10 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
+    // Audit
+    const changedFields = Object.keys(fields).filter(k => (fields as any)[k] !== undefined);
+    db.recordAudit(req.agent!.org_id, req.agent!.id, 'bot.profile_update', 'agent', req.agent!.id, { fields: changedFields });
+
     req.agent = updated;
     res.json(toAgentResponse(updated));
   });
@@ -1850,6 +1854,10 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     }
 
     const settings = db.updateOrgSettings(req.org!.id, updates);
+
+    // Audit
+    db.recordAudit(req.org!.id, null, 'settings.update', 'org_settings', req.org!.id, updates);
+
     res.json(settings);
   });
 

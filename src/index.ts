@@ -91,7 +91,9 @@ function main() {
 
   // Run once on startup after a delay
   setTimeout(() => {
-    try { db.runLifecycleCleanup(); } catch {}
+    try { db.runLifecycleCleanup(); } catch (err) {
+      console.error('Startup lifecycle cleanup error:', err);
+    }
   }, 30000);
 
   // Graceful shutdown
