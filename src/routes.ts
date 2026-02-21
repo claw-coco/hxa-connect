@@ -1,4 +1,8 @@
 import { Router } from 'express';
+import multer from 'multer';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import type { HubDB } from './db.js';
 import type { HubWS } from './ws.js';
 import { authMiddleware, requireAgent, requireOrg } from './auth.js';
@@ -1223,6 +1227,123 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     });
 
     res.json(enriched);
+  });
+
+  // ─── Files ───────────────────────────────────────────────
+
+  const filesDir = path.join(config.data_dir, 'files');
+  fs.mkdirSync(filesDir, { recursive: true });
+
+  const upload = multer({
+    storage: multer.diskStorage({
+      destination: (_req, _file, cb) => cb(null, filesDir),
+      filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname);
+        cb(null, `${crypto.randomUUID()}${ext}`);
+      },
+    }),
+    limits: {
+      fileSize: config.max_file_size_mb * 1024 * 1024,
+    },
+  });
+
+  /**
+   * POST /api/files/upload — Upload a file (multipart/form-data)
+   * Auth: agent token
+   * Returns: { id, name, mime_type, size, url, created_at }
+   */
+  auth.post('/api/files/upload', requireAgent, upload.single('file'), (req, res) => {
+    const file = req.file;
+    if (!file) {
+      res.status(400).json({ error: 'No file provided (field name must be "file")' });
+      return;
+    }
+
+    const orgId = req.agent!.org_id;
+    const relativePath = `files/${file.filename}`;
+
+    const record = db.createFile(
+      orgId,
+      req.agent!.id,
+      file.originalname,
+      file.mimetype || null,
+      file.size,
+      relativePath,
+    );
+
+    res.json({
+      id: record.id,
+      name: record.name,
+      mime_type: record.mime_type,
+      size: record.size,
+      url: `/api/files/${record.id}`,
+      created_at: record.created_at,
+    });
+  });
+
+  /**
+   * GET /api/files/:id — Download a file
+   * Auth: agent token or org API key
+   * Org-scoped: only agents/admins in the same org can download
+   */
+  auth.get('/api/files/:id', (req, res) => {
+    const orgId = requireOrgOrAgent(req, res);
+    if (!orgId) return;
+
+    const record = db.getFile(req.params.id as string);
+    if (!record) {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
+
+    if (record.org_id !== orgId) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    const diskPath = path.join(config.data_dir, record.path);
+    if (!fs.existsSync(diskPath)) {
+      res.status(404).json({ error: 'File not found on disk' });
+      return;
+    }
+
+    res.setHeader('Content-Type', record.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(record.name)}"`);
+    res.setHeader('Content-Length', record.size);
+
+    const stream = fs.createReadStream(diskPath);
+    stream.pipe(res);
+  });
+
+  /**
+   * GET /api/files/:id/info — Get file metadata
+   * Auth: agent token or org API key
+   * Org-scoped access check
+   */
+  auth.get('/api/files/:id/info', (req, res) => {
+    const orgId = requireOrgOrAgent(req, res);
+    if (!orgId) return;
+
+    const record = db.getFileInfo(req.params.id as string);
+    if (!record) {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
+
+    if (record.org_id !== orgId) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    res.json({
+      id: record.id,
+      name: record.name,
+      mime_type: record.mime_type,
+      size: record.size,
+      uploader_id: record.uploader_id,
+      url: `/api/files/${record.id}`,
+      created_at: record.created_at,
+    });
   });
 
   // Mount authenticated routes

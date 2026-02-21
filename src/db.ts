@@ -19,6 +19,7 @@ import type {
   ThreadType,
   ThreadStatus,
   CloseReason,
+  FileRecord,
 } from './types.js';
 
 // ─── Database Layer ──────────────────────────────────────────
@@ -151,6 +152,18 @@ export class HubDB {
       CREATE INDEX IF NOT EXISTS idx_thread_participants_bot ON thread_participants(bot_id);
       CREATE INDEX IF NOT EXISTS idx_thread_messages ON thread_messages(thread_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS files (
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+        uploader_id TEXT NOT NULL REFERENCES agents(id) ON DELETE SET NULL,
+        name TEXT NOT NULL,
+        mime_type TEXT,
+        size INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_files_org ON files(org_id, created_at);
     `);
 
     // Migration: add admin_secret to existing orgs that don't have it
@@ -1442,6 +1455,37 @@ export class HubDB {
     `).all(threadId, key) as any[];
 
     return rows.map(row => this.rowToArtifact(row));
+  }
+
+  // ─── File Operations ────────────────────────────────────
+
+  createFile(orgId: string, uploaderId: string, name: string, mimeType: string | null, size: number, diskPath: string): FileRecord {
+    const file: FileRecord = {
+      id: crypto.randomUUID(),
+      org_id: orgId,
+      uploader_id: uploaderId,
+      name,
+      mime_type: mimeType,
+      size,
+      path: diskPath,
+      created_at: Date.now(),
+    };
+
+    this.db.prepare(`
+      INSERT INTO files (id, org_id, uploader_id, name, mime_type, size, path, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(file.id, file.org_id, file.uploader_id, file.name, file.mime_type, file.size, file.path, file.created_at);
+
+    return file;
+  }
+
+  getFile(fileId: string): FileRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM files WHERE id = ?').get(fileId) as FileRecord | undefined;
+    return row || undefined;
+  }
+
+  getFileInfo(fileId: string): FileRecord | undefined {
+    return this.getFile(fileId);
   }
 
   close() {
