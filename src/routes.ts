@@ -783,8 +783,8 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     const thread = requireThreadParticipant(req, res, req.params.id as string);
     if (!thread) return;
 
-    const { status: statusInput, close_reason, context } = req.body;
-    if (statusInput === undefined && context === undefined && close_reason === undefined) {
+    const { status: statusInput, close_reason, context, topic } = req.body;
+    if (statusInput === undefined && context === undefined && close_reason === undefined && topic === undefined) {
       res.status(400).json({ error: 'No updatable fields provided' });
       return;
     }
@@ -792,6 +792,11 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     // Block all mutations on terminal threads (status transitions handled separately in updateThreadStatus)
     if ((thread.status === 'resolved' || thread.status === 'closed') && statusInput === undefined) {
       res.status(409).json({ error: 'Thread is in terminal state; no updates allowed' });
+      return;
+    }
+
+    if (topic !== undefined && (typeof topic !== 'string' || topic.trim().length === 0)) {
+      res.status(400).json({ error: 'topic must be a non-empty string' });
       return;
     }
 
@@ -873,6 +878,15 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
           return;
         }
         changes.push('context');
+      }
+
+      if (topic !== undefined) {
+        updated = db.updateThreadTopic(thread.id, topic.trim());
+        if (!updated) {
+          res.status(404).json({ error: 'Thread not found' });
+          return;
+        }
+        changes.push('topic');
       }
     } catch (error: any) {
       res.status(400).json({ error: error.message || 'Failed to update thread' });
@@ -1093,7 +1107,8 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
   });
 
   /**
-   * POST /api/threads/:id/artifacts — Add artifact (new key or new version)
+   * POST /api/threads/:id/artifacts — Add new artifact (new key only)
+   * Use PATCH to update existing artifacts with new versions.
    */
   auth.post('/api/threads/:id/artifacts', requireAgent, (req, res) => {
     const thread = requireThreadParticipant(req, res, req.params.id as string);
@@ -1143,6 +1158,13 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     }
     if (mime_type !== undefined && mime_type !== null && typeof mime_type !== 'string') {
       res.status(400).json({ error: 'mime_type must be a string or null' });
+      return;
+    }
+
+    // POST only creates new artifact keys; use PATCH to update existing ones
+    const existing = db.getArtifact(thread.id, artifact_key);
+    if (existing) {
+      res.status(409).json({ error: `Artifact key "${artifact_key}" already exists. Use PATCH to update it.` });
       return;
     }
 
@@ -1547,6 +1569,20 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     }
 
     const orgId = req.agent!.org_id;
+
+    // Enforce daily upload quota
+    const dailyBytes = db.getDailyUploadBytes(orgId);
+    const dailyLimitBytes = config.file_upload_mb_per_day * 1024 * 1024;
+    if (dailyBytes + file.size > dailyLimitBytes) {
+      // Clean up the uploaded file since we're rejecting it
+      fs.unlinkSync(file.path);
+      const usedMb = Math.round(dailyBytes / 1024 / 1024);
+      res.status(429).json({
+        error: `Daily upload quota exceeded (${usedMb}MB / ${config.file_upload_mb_per_day}MB used today)`,
+      });
+      return;
+    }
+
     const relativePath = `files/${file.filename}`;
 
     const record = db.createFile(
@@ -1588,7 +1624,12 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
-    const diskPath = path.join(config.data_dir, record.path);
+    const diskPath = path.resolve(config.data_dir, record.path);
+    // Path traversal guard: ensure resolved path stays inside data_dir
+    if (!diskPath.startsWith(path.resolve(config.data_dir) + path.sep)) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
     if (!fs.existsSync(diskPath)) {
       res.status(404).json({ error: 'File not found on disk' });
       return;

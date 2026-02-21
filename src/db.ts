@@ -158,7 +158,7 @@ export class HubDB {
       CREATE TABLE IF NOT EXISTS files (
         id TEXT PRIMARY KEY,
         org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
-        uploader_id TEXT NOT NULL REFERENCES agents(id) ON DELETE SET NULL,
+        uploader_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
         name TEXT NOT NULL,
         mime_type TEXT,
         size INTEGER NOT NULL,
@@ -856,7 +856,7 @@ export class HubDB {
     const now = Date.now();
     for (const { thread_id } of soloThreads) {
       this.db.prepare(`
-        UPDATE threads SET status = 'closed', close_reason = 'manual', updated_at = ?, last_activity_at = ?
+        UPDATE threads SET status = 'closed', close_reason = 'error', updated_at = ?, last_activity_at = ?
         WHERE id = ? AND status NOT IN ('resolved', 'closed')
       `).run(now, now, thread_id);
     }
@@ -1160,6 +1160,19 @@ export class HubDB {
       SET context = ?, updated_at = ?
       WHERE id = ?
     `).run(context, Date.now(), threadId);
+
+    return this.getThread(threadId);
+  }
+
+  updateThreadTopic(threadId: string, topic: string): Thread | undefined {
+    const current = this.getThread(threadId);
+    if (!current) return undefined;
+
+    this.db.prepare(`
+      UPDATE threads
+      SET topic = ?, updated_at = ?
+      WHERE id = ?
+    `).run(topic, Date.now(), threadId);
 
     return this.getThread(threadId);
   }
@@ -1523,6 +1536,15 @@ export class HubDB {
 
   getFileInfo(fileId: string): FileRecord | undefined {
     return this.getFile(fileId);
+  }
+
+  getDailyUploadBytes(orgId: string): number {
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    const row = this.db.prepare(
+      'SELECT COALESCE(SUM(size), 0) as total FROM files WHERE org_id = ? AND created_at >= ?'
+    ).get(orgId, dayStart.getTime()) as { total: number };
+    return row.total;
   }
   // ─── Catchup Event Operations ─────────────────────────────
 
