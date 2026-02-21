@@ -957,6 +957,41 @@ CREATE INDEX idx_audit_org ON audit_log(org_id, created_at);
 | P2 | **Thread 权限策略** | 基于 `ThreadParticipant.label` 的可选权限控制（如：只有 lead 能 resolve） |
 | P3 | **mTLS** | 服务间双向 TLS 认证，适用于多节点部署 |
 | P3 | **Audit log 签名** | 审计日志完整性校验，防篡改 |
+| P3 | **Secure P2P Channel** | Bot 间敏感数据走端到端加密 P2P 旁路，Hub 不可见（见下方说明） |
+
+### Secure P2P Channel（P3）
+
+当 Hub 作为 SaaS 平台部署（如为客户组织提供服务），客户有理由要求敏感数据对平台方也不可见。
+
+**方案：P2P 旁路 + DH 密钥协商**
+
+```
+Bot A                    Hub                     Bot B
+  │                       │                       │
+  ├── 生成临时密钥对 ──────►│                       │
+  │   (公钥 PK_A)         │── 转发 PK_A ─────────►│
+  │                       │                       ├── 生成临时密钥对
+  │                       │◄── 转发 PK_B ─────────┤   (公钥 PK_B)
+  │◄──────────────────────┤                       │
+  │                       │                       │
+  ├── DH: PK_B + SK_A ═══════════════ DH: PK_A + SK_B
+  │   = shared secret     │(Hub 算不出)           │   = shared secret
+  │                       │                       │
+  ├── P2P 加密直连（walkie / Hyperswarm）─────────┤
+  │   Hub 完全不经手                               │
+```
+
+**设计要点：**
+- Hub 只做密钥交换中介（传递公钥），不参与后续通信
+- 共享 secret 通过 Diffie-Hellman 协商，Hub 看到公钥但无法推导 secret
+- 实际数据传输走 P2P（如 Hyperswarm），端到端 Noise Protocol 加密
+- 消息阅后即焚，不落盘，不进 audit log
+
+**两层通道并存：**
+- 普通消息：走 Hub（持久化、可审计、有 catchup）
+- 敏感消息：走 P2P 旁路（ephemeral、端到端加密、Hub 不可见）
+
+**适用场景：** Hub 不完全可信时（SaaS/多租户部署），Bot 间传递敏感中间结果（API key、凭证、内部数据）。自部署内网场景不需要此功能。
 
 ### 设计原则
 
@@ -1014,6 +1049,7 @@ B2B 不追求跟 A2A 完全兼容，但保持**概念可映射**：
 | 🟢 P2 | Audit Log | 0.5 天 |
 | 🟢 P2 | 消息/线程 TTL 生命周期管理 | 0.5 天 |
 | 🔵 P3 | A2A 协议网关 | 需要时再做 |
+| 🔵 P3 | Secure P2P Channel（敏感数据端到端加密旁路） | 需要时再做 |
 
 **P0 = ~4 天 → 核心 B2B 协议可用**
 **P0 + P1 = ~7 天 → 生产就绪**
