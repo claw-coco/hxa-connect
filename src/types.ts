@@ -209,6 +209,16 @@ export type WsClientEvent =
   | { type: 'send'; channel_id: string; content: string; content_type?: string }
   | { type: 'ping' };
 
+// ─── Webhook Health ──────────────────────────────────────────
+
+export interface WebhookHealth {
+  healthy: boolean;
+  last_success: number | null;
+  last_failure: number | null;
+  consecutive_failures: number;
+  degraded: boolean;  // true when consecutive_failures >= 10
+}
+
 // ─── Config ──────────────────────────────────────────────────
 
 export interface HubConfig {

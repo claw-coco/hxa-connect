@@ -1,6 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server } from 'node:http';
 import type { HubDB } from './db.js';
+import type { WebhookManager } from './webhook.js';
 import type { Message, WsServerEvent } from './types.js';
 import { URL } from 'node:url';
 
@@ -15,9 +16,11 @@ export class HubWS {
   private wss: WebSocketServer;
   private clients: Set<WsClient> = new Set();
   private db: HubDB;
+  private webhookManager: WebhookManager;
 
-  constructor(server: Server, db: HubDB) {
+  constructor(server: Server, db: HubDB, webhookManager: WebhookManager) {
     this.db = db;
+    this.webhookManager = webhookManager;
     this.wss = new WebSocketServer({ server, path: '/ws' });
 
     this.wss.on('connection', (ws, req) => {
@@ -40,6 +43,9 @@ export class HubWS {
         };
         this.clients.add(client);
         db.setAgentOnline(agent.id, true);
+
+        // Reset degraded webhook status on reconnect
+        db.resetWebhookDegraded(agent.id);
 
         // Broadcast online status
         this.broadcastToOrg(agent.org_id, {
@@ -142,11 +148,6 @@ export class HubWS {
       if (agentId === message.sender_id) continue;
       const agent = this.db.getAgentById(agentId);
       if (agent?.webhook_url) {
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (agent.webhook_secret) {
-          headers['Authorization'] = `Bearer ${agent.webhook_secret}`;
-        }
-
         // Send structured webhook payload for channel plugins
         const payload = {
           channel_id: channelId,
@@ -159,16 +160,9 @@ export class HubWS {
           created_at: message.created_at,
         };
 
-        console.log(`  📤 Webhook → ${agent.name} (${agent.webhook_url})`);
-        fetch(agent.webhook_url, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(payload),
-        }).then(res => {
-          console.log(`  📤 Webhook ${agent.name}: ${res.status} ${res.statusText}`);
-        }).catch(err => {
-          console.log(`  ❌ Webhook ${agent.name} failed: ${err.message}`);
-        });
+        console.log(`  \ud83d\udce4 Webhook \u2192 ${agent.name} (${agent.webhook_url})`);
+        // Fire-and-forget — retries happen in background
+        void this.webhookManager.deliver(agent.id, agent.webhook_url, agent.webhook_secret, payload);
       }
     }
 
@@ -242,21 +236,9 @@ export class HubWS {
       const agent = this.db.getAgentById(agentId);
       if (!agent?.webhook_url) continue;
 
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (agent.webhook_secret) {
-        headers['Authorization'] = `Bearer ${agent.webhook_secret}`;
-      }
-
-      console.log(`  📤 Thread webhook → ${agent.name} (${agent.webhook_url})`);
-      fetch(agent.webhook_url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(event),
-      }).then(res => {
-        console.log(`  📤 Thread webhook ${agent.name}: ${res.status} ${res.statusText}`);
-      }).catch(err => {
-        console.log(`  ❌ Thread webhook ${agent.name} failed: ${err.message}`);
-      });
+      console.log(`  \ud83d\udce4 Thread webhook \u2192 ${agent.name} (${agent.webhook_url})`);
+      // Fire-and-forget — retries happen in background
+      void this.webhookManager.deliver(agent.id, agent.webhook_url, agent.webhook_secret, event);
     }
   }
 }

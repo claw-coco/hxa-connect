@@ -19,6 +19,7 @@ import type {
   ThreadType,
   ThreadStatus,
   CloseReason,
+  WebhookHealth,
 } from './types.js';
 
 // ─── Database Layer ──────────────────────────────────────────
@@ -151,6 +152,14 @@ export class HubDB {
       CREATE INDEX IF NOT EXISTS idx_thread_participants_bot ON thread_participants(bot_id);
       CREATE INDEX IF NOT EXISTS idx_thread_messages ON thread_messages(thread_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS webhook_status (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+        last_success INTEGER,
+        last_failure INTEGER,
+        consecutive_failures INTEGER DEFAULT 0,
+        degraded INTEGER DEFAULT 0
+      );
     `);
 
     // Migration: add admin_secret to existing orgs that don't have it
@@ -1442,6 +1451,58 @@ export class HubDB {
     `).all(threadId, key) as any[];
 
     return rows.map(row => this.rowToArtifact(row));
+  }
+
+  // ─── Webhook Status Operations ──────────────────────────
+
+  recordWebhookSuccess(agentId: string) {
+    this.db.prepare(`
+      INSERT INTO webhook_status (agent_id, last_success, last_failure, consecutive_failures, degraded)
+      VALUES (?, ?, NULL, 0, 0)
+      ON CONFLICT(agent_id) DO UPDATE SET
+        last_success = ?,
+        consecutive_failures = 0,
+        degraded = 0
+    `).run(agentId, Date.now(), Date.now());
+  }
+
+  recordWebhookFailure(agentId: string) {
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO webhook_status (agent_id, last_success, last_failure, consecutive_failures, degraded)
+      VALUES (?, NULL, ?, 1, 0)
+      ON CONFLICT(agent_id) DO UPDATE SET
+        last_failure = ?,
+        consecutive_failures = consecutive_failures + 1,
+        degraded = CASE WHEN consecutive_failures + 1 >= 10 THEN 1 ELSE degraded END
+    `).run(agentId, now, now);
+  }
+
+  getWebhookHealth(agentId: string): WebhookHealth | null {
+    const row = this.db.prepare(
+      'SELECT * FROM webhook_status WHERE agent_id = ?'
+    ).get(agentId) as any;
+    if (!row) return null;
+    return {
+      healthy: row.consecutive_failures === 0,
+      last_success: row.last_success ?? null,
+      last_failure: row.last_failure ?? null,
+      consecutive_failures: row.consecutive_failures,
+      degraded: !!row.degraded,
+    };
+  }
+
+  isWebhookDegraded(agentId: string): boolean {
+    const row = this.db.prepare(
+      'SELECT degraded FROM webhook_status WHERE agent_id = ?'
+    ).get(agentId) as any;
+    return !!row?.degraded;
+  }
+
+  resetWebhookDegraded(agentId: string) {
+    this.db.prepare(`
+      UPDATE webhook_status SET degraded = 0, consecutive_failures = 0 WHERE agent_id = ?
+    `).run(agentId);
   }
 
   close() {

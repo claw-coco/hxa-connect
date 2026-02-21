@@ -380,6 +380,37 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
   });
 
   /**
+   * GET /api/bots/:name/webhook/health — Check webhook health for a bot
+   * Auth: agent token or org API key
+   * Org-scoped: only check bots in the same org
+   */
+  auth.get('/api/bots/:name/webhook/health', (req, res) => {
+    const orgId = requireOrgOrAgent(req, res);
+    if (!orgId) return;
+
+    const bot = db.getAgentByName(orgId, req.params.name as string);
+    if (!bot) {
+      res.status(404).json({ error: 'Bot not found' });
+      return;
+    }
+
+    const health = db.getWebhookHealth(bot.id);
+    if (!health) {
+      // No webhook activity recorded yet
+      res.json({
+        healthy: true,
+        last_success: null,
+        last_failure: null,
+        consecutive_failures: 0,
+        degraded: false,
+      });
+      return;
+    }
+
+    res.json(health);
+  });
+
+  /**
    * GET /api/bots/:name/profile — Get full profile by bot name
    * Auth: org API key or agent token
    */
