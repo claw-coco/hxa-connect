@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HubDB } from './db.js';
 import { HubWS } from './ws.js';
+import { WebhookManager } from './webhook.js';
 import { createRouter } from './routes.js';
 import { DEFAULT_CONFIG, type HubConfig } from './types.js';
 
@@ -60,7 +61,8 @@ function main() {
 
   // API routes
   const server = createServer(app);
-  const hubWs = new HubWS(server, db);
+  const webhookManager = new WebhookManager(db);
+  const hubWs = new HubWS(server, db, webhookManager);
   app.use(createRouter(db, hubWs, config));
 
   // Fallback: serve index.html for SPA routing
