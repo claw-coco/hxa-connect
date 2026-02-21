@@ -1,3 +1,13 @@
+// ─── MessageV2: Structured Message Parts ─────────────────────
+
+export type MessagePart =
+  | { type: 'text'; content: string }
+  | { type: 'markdown'; content: string }
+  | { type: 'json'; content: Record<string, unknown> }
+  | { type: 'file'; url: string; name: string; mime_type: string; size?: number }
+  | { type: 'image'; url: string; alt?: string }
+  | { type: 'link'; url: string; title?: string };
+
 // ─── Core Entities ───────────────────────────────────────────
 
 export interface Org {
@@ -55,6 +65,7 @@ export interface Message {
   sender_id: string;
   content: string;
   content_type: 'text' | 'json' | 'system';
+  parts: string | null; // JSON string of MessagePart[]
   created_at: number;
 }
 
@@ -91,6 +102,7 @@ export interface ThreadMessage {
   sender_id: string | null;
   content: string;
   content_type: string;
+  parts: string | null; // JSON string of MessagePart[]
   metadata: string | null; // JSON string
   created_at: number;
 }
@@ -180,33 +192,45 @@ export interface CreateChannelRequest {
 }
 
 export interface SendMessageRequest {
-  content: string;
+  content?: string;
   content_type?: 'text' | 'json';
+  parts?: MessagePart[];
 }
 
 export interface DirectSendRequest {
   to: string; // agent ID or name
-  content: string;
+  content?: string;
   content_type?: 'text' | 'json';
+  parts?: MessagePart[];
+}
+
+// ─── Wire-format messages (parts as parsed array) ────────────
+
+export interface WireMessage extends Omit<Message, 'parts'> {
+  parts: MessagePart[];
+}
+
+export interface WireThreadMessage extends Omit<ThreadMessage, 'parts'> {
+  parts: MessagePart[];
 }
 
 // ─── WebSocket Events ────────────────────────────────────────
 
 export type WsServerEvent =
-  | { type: 'message'; channel_id: string; message: Message; sender_name: string }
+  | { type: 'message'; channel_id: string; message: WireMessage; sender_name: string }
   | { type: 'agent_online'; agent: Pick<Agent, 'id' | 'name' | 'display_name'> }
   | { type: 'agent_offline'; agent: Pick<Agent, 'id' | 'name' | 'display_name'> }
   | { type: 'channel_created'; channel: Channel; members: string[] }
   | { type: 'thread_created'; thread: Thread }
   | { type: 'thread_updated'; thread: Thread; changes: string[] }
-  | { type: 'thread_message'; thread_id: string; message: ThreadMessage }
+  | { type: 'thread_message'; thread_id: string; message: WireThreadMessage }
   | { type: 'thread_artifact'; thread_id: string; artifact: Artifact; action: 'added' | 'updated' }
   | { type: 'thread_participant'; thread_id: string; bot_id: string; action: 'joined' | 'left' }
   | { type: 'error'; message: string }
   | { type: 'pong' };
 
 export type WsClientEvent =
-  | { type: 'send'; channel_id: string; content: string; content_type?: string }
+  | { type: 'send'; channel_id: string; content?: string; content_type?: string; parts?: MessagePart[] }
   | { type: 'ping' };
 
 // ─── Config ──────────────────────────────────────────────────

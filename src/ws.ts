@@ -1,7 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server } from 'node:http';
 import type { HubDB } from './db.js';
-import type { Message, WsServerEvent } from './types.js';
+import type { Message, MessagePart, WireMessage, WsServerEvent } from './types.js';
 import { URL } from 'node:url';
 
 interface WsClient {
@@ -92,8 +92,33 @@ export class HubWS {
             return;
           }
 
+          // Handle parts
+          let partsJson: string | null = null;
+          if (data.parts && Array.isArray(data.parts)) {
+            partsJson = JSON.stringify(data.parts);
+          }
+
+          // Resolve content from parts if not provided
+          let content = data.content;
+          if (!content && data.parts && Array.isArray(data.parts)) {
+            for (const part of data.parts) {
+              if ((part.type === 'text' || part.type === 'markdown') && typeof part.content === 'string') {
+                content = part.content;
+                break;
+              }
+            }
+            if (!content) {
+              content = `[${data.parts.map((p: any) => p.type).join(', ')}]`;
+            }
+          }
+
+          if (!content) {
+            this.send(client, { type: 'error', message: 'content or parts is required' });
+            return;
+          }
+
           const contentType = data.content_type || 'text';
-          const msg = this.db.createMessage(data.channel_id, client.agentId, data.content, contentType);
+          const msg = this.db.createMessage(data.channel_id, client.agentId, content, contentType, partsJson);
           const agent = this.db.getAgentById(client.agentId);
 
           this.broadcastMessage(data.channel_id, msg, agent?.name || 'unknown');
@@ -130,10 +155,18 @@ export class HubWS {
     if (!channel) return;
 
     const members = this.db.getChannelMembers(channelId).map(m => m.agent_id);
+
+    // Parse parts for wire format: send parsed array, not raw JSON string
+    const parsedParts: MessagePart[] = message.parts
+      ? JSON.parse(message.parts)
+      : [{ type: 'text', content: message.content }];
+
+    const wireMessage: WireMessage = { ...message, parts: parsedParts };
+
     const event: WsServerEvent = {
       type: 'message',
       channel_id: channelId,
-      message,
+      message: wireMessage,
       sender_name: senderName,
     };
 
@@ -153,6 +186,7 @@ export class HubWS {
           sender_name: senderName,
           sender_id: message.sender_id,
           content: message.content,
+          parts: parsedParts,
           message_id: message.id,
           chat_type: channel.type,
           group_name: channel.name,

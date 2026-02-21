@@ -224,6 +224,18 @@ export class HubDB {
 
     this.db.prepare(`UPDATE agents SET version = '1.0.0' WHERE version IS NULL OR version = ''`).run();
 
+    // Migration: add parts column to messages and thread_messages
+    try {
+      this.db.exec(`ALTER TABLE messages ADD COLUMN parts TEXT`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE thread_messages ADD COLUMN parts TEXT`);
+    } catch {
+      // Column already exists
+    }
+
     // Migration: fix FK constraints on threads/thread_messages/artifacts
     // SQLite cannot ALTER FK constraints, so we must recreate tables.
     this.migrateThreadForeignKeys();
@@ -367,6 +379,7 @@ export class HubDB {
       ...row,
       sender_id: row.sender_id ?? null,
       content_type: row.content_type ?? 'text',
+      parts: row.parts ?? null,
       metadata: row.metadata ?? null,
     };
   }
@@ -921,20 +934,21 @@ export class HubDB {
 
   // ─── Message Operations ──────────────────────────────────
 
-  createMessage(channelId: string, senderId: string, content: string, contentType = 'text'): Message {
+  createMessage(channelId: string, senderId: string, content: string, contentType = 'text', parts?: string | null): Message {
     const msg: Message = {
       id: crypto.randomUUID(),
       channel_id: channelId,
       sender_id: senderId,
       content,
       content_type: contentType as Message['content_type'],
+      parts: parts ?? null,
       created_at: Date.now(),
     };
 
     this.db.prepare(
-      `INSERT INTO messages (id, channel_id, sender_id, content, content_type, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(msg.id, msg.channel_id, msg.sender_id, msg.content, msg.content_type, msg.created_at);
+      `INSERT INTO messages (id, channel_id, sender_id, content, content_type, parts, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(msg.id, msg.channel_id, msg.sender_id, msg.content, msg.content_type, msg.parts, msg.created_at);
 
     return msg;
   }
@@ -1191,6 +1205,7 @@ export class HubDB {
     content: string,
     contentType = 'text',
     metadata?: string | null,
+    parts?: string | null,
   ): ThreadMessage {
     const msg: ThreadMessage = {
       id: crypto.randomUUID(),
@@ -1198,13 +1213,14 @@ export class HubDB {
       sender_id: senderId,
       content,
       content_type: contentType,
+      parts: parts ?? null,
       metadata: metadata ?? null,
       created_at: Date.now(),
     };
 
     const insertMessageStmt = this.db.prepare(`
-      INSERT INTO thread_messages (id, thread_id, sender_id, content, content_type, metadata, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO thread_messages (id, thread_id, sender_id, content, content_type, parts, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const updateActivityStmt = this.db.prepare(`
       UPDATE threads SET last_activity_at = ? WHERE id = ?
@@ -1217,6 +1233,7 @@ export class HubDB {
         msg.sender_id,
         msg.content,
         msg.content_type,
+        msg.parts,
         msg.metadata,
         msg.created_at,
       );

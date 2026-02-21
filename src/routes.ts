@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { HubDB } from './db.js';
 import type { HubWS } from './ws.js';
 import { authMiddleware, requireAgent, requireOrg } from './auth.js';
-import type { HubConfig, Agent, AgentProfileInput, Thread, ThreadStatus, ThreadType, CloseReason, ArtifactType } from './types.js';
+import type { HubConfig, Agent, AgentProfileInput, Thread, ThreadStatus, ThreadType, CloseReason, ArtifactType, MessagePart, Message, ThreadMessage, WireMessage, WireThreadMessage } from './types.js';
 
 function parseJsonField<T>(value: string | null): T | null {
   if (!value) return null;
@@ -41,6 +41,81 @@ function toAgentResponse(agent: Agent) {
 function getQueryString(value: unknown): string | undefined {
   if (Array.isArray(value)) return typeof value[0] === 'string' ? value[0] : undefined;
   return typeof value === 'string' ? value : undefined;
+}
+
+// ─── MessageV2 Helpers ───────────────────────────────────────
+
+const VALID_PART_TYPES = new Set(['text', 'markdown', 'json', 'file', 'image', 'link']);
+
+/**
+ * Validate an array of message parts. Returns an error string or null.
+ */
+function validateParts(parts: unknown): string | null {
+  if (!Array.isArray(parts)) return 'parts must be an array';
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part || typeof part !== 'object') return `parts[${i}] must be an object`;
+    if (!VALID_PART_TYPES.has(part.type)) return `parts[${i}].type is invalid (got "${part.type}")`;
+
+    switch (part.type) {
+      case 'text':
+      case 'markdown':
+        if (typeof part.content !== 'string') return `parts[${i}].content must be a string`;
+        break;
+      case 'json':
+        if (part.content === null || typeof part.content !== 'object') return `parts[${i}].content must be an object`;
+        break;
+      case 'file':
+        if (typeof part.url !== 'string') return `parts[${i}].url is required`;
+        if (typeof part.name !== 'string') return `parts[${i}].name is required`;
+        if (typeof part.mime_type !== 'string') return `parts[${i}].mime_type is required`;
+        break;
+      case 'image':
+        if (typeof part.url !== 'string') return `parts[${i}].url is required`;
+        break;
+      case 'link':
+        if (typeof part.url !== 'string') return `parts[${i}].url is required`;
+        break;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extract a plain text content string from parts array for backward compat.
+ * Uses the first text or markdown part.
+ */
+function contentFromParts(parts: MessagePart[]): string {
+  for (const part of parts) {
+    if (part.type === 'text' || part.type === 'markdown') return part.content;
+  }
+  // Fallback: describe what the message contains
+  const types = parts.map(p => p.type);
+  return `[${types.join(', ')}]`;
+}
+
+/**
+ * Enrich a Message for wire format: parse parts JSON string into array.
+ * When parts is null (legacy message), auto-generate from content.
+ */
+function enrichMessage(msg: Message): WireMessage {
+  const parsed: MessagePart[] = msg.parts
+    ? JSON.parse(msg.parts)
+    : [{ type: 'text', content: msg.content }];
+  return { ...msg, parts: parsed };
+}
+
+/**
+ * Enrich a ThreadMessage for wire format: parse parts JSON string into array.
+ * When parts is null (legacy message), auto-generate from content.
+ */
+function enrichThreadMessage(msg: ThreadMessage): WireThreadMessage {
+  const parsed: MessagePart[] = msg.parts
+    ? JSON.parse(msg.parts)
+    : [{ type: 'text', content: msg.content }];
+  return { ...msg, parts: parsed };
 }
 
 const THREAD_TYPES = new Set<ThreadType>(['discussion', 'request', 'collab']);
@@ -857,13 +932,27 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
-    const { content, content_type, metadata } = req.body;
-    if (!content || typeof content !== 'string') {
-      res.status(400).json({ error: 'content is required' });
+    const { content, content_type, metadata, parts } = req.body;
+
+    // Validate parts if provided
+    let partsJson: string | null = null;
+    if (parts !== undefined) {
+      const partsError = validateParts(parts);
+      if (partsError) {
+        res.status(400).json({ error: partsError });
+        return;
+      }
+      partsJson = JSON.stringify(parts);
+    }
+
+    // Resolve content: explicit content, or auto-generate from parts
+    const resolvedContent: string | undefined = content ?? (parts ? contentFromParts(parts as MessagePart[]) : undefined);
+    if (!resolvedContent || typeof resolvedContent !== 'string') {
+      res.status(400).json({ error: 'content or parts is required' });
       return;
     }
 
-    if (content.length > config.max_message_length) {
+    if (resolvedContent.length > config.max_message_length) {
       res.status(400).json({ error: `Message too long (max ${config.max_message_length} chars)` });
       return;
     }
@@ -887,18 +976,21 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     const message = db.createThreadMessage(
       thread.id,
       req.agent!.id,
-      content,
+      resolvedContent,
       typeof content_type === 'string' ? content_type : 'text',
       metadataJson,
+      partsJson,
     );
+
+    const enriched = enrichThreadMessage(message);
 
     ws.broadcastThreadEvent(thread.org_id, thread.id, {
       type: 'thread_message',
       thread_id: thread.id,
-      message,
+      message: enriched,
     });
 
-    res.json(message);
+    res.json(enriched);
   });
 
   /**
@@ -916,7 +1008,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     const messages = db.getThreadMessages(thread.id, limit, before);
     const enriched = messages.map(m => {
       const sender = m.sender_id ? db.getAgentById(m.sender_id) : undefined;
-      return { ...m, sender_name: sender?.name || 'unknown' };
+      return { ...enrichThreadMessage(m), sender_name: sender?.name || 'unknown' };
     });
 
     res.json(enriched.reverse());
@@ -1101,23 +1193,37 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
-    const { content, content_type } = req.body;
-    if (!content) {
-      res.status(400).json({ error: 'content is required' });
+    const { content, content_type, parts } = req.body;
+
+    // Validate parts if provided
+    let partsJson: string | null = null;
+    if (parts !== undefined) {
+      const partsError = validateParts(parts);
+      if (partsError) {
+        res.status(400).json({ error: partsError });
+        return;
+      }
+      partsJson = JSON.stringify(parts);
+    }
+
+    // Resolve content: explicit content, or auto-generate from parts
+    const resolvedContent: string | undefined = content ?? (parts ? contentFromParts(parts as MessagePart[]) : undefined);
+    if (!resolvedContent) {
+      res.status(400).json({ error: 'content or parts is required' });
       return;
     }
 
-    if (content.length > config.max_message_length) {
+    if (resolvedContent.length > config.max_message_length) {
       res.status(400).json({ error: `Message too long (max ${config.max_message_length} chars)` });
       return;
     }
 
-    const msg = db.createMessage(channel.id, req.agent!.id, content, content_type || 'text');
+    const msg = db.createMessage(channel.id, req.agent!.id, resolvedContent, content_type || 'text', partsJson);
 
     // Broadcast via WebSocket
     ws.broadcastMessage(channel.id, msg, req.agent!.name);
 
-    res.json(msg);
+    res.json(enrichMessage(msg));
   });
 
   /**
@@ -1147,10 +1253,10 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
     const messages = db.getMessages(channel.id, limit, before);
 
-    // Enrich with sender names
+    // Enrich with sender names and parsed parts
     const enriched = messages.map(m => {
       const sender = m.sender_id ? db.getAgentById(m.sender_id) : undefined;
-      return { ...m, sender_name: sender?.name || 'unknown' };
+      return { ...enrichMessage(m), sender_name: sender?.name || 'unknown' };
     });
 
     res.json(enriched.reverse()); // Return in chronological order
@@ -1161,9 +1267,24 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
    * Body: { to, content, content_type? }
    */
   auth.post('/api/send', requireAgent, (req, res) => {
-    const { to, content, content_type } = req.body;
-    if (!to || !content) {
-      res.status(400).json({ error: 'to and content are required' });
+    const { to, content, content_type, parts } = req.body;
+
+    // Validate parts if provided
+    let partsJson: string | null = null;
+    if (parts !== undefined) {
+      const partsError = validateParts(parts);
+      if (partsError) {
+        res.status(400).json({ error: partsError });
+        return;
+      }
+      partsJson = JSON.stringify(parts);
+    }
+
+    // Resolve content: explicit content, or auto-generate from parts
+    const resolvedContent: string | undefined = content ?? (parts ? contentFromParts(parts as MessagePart[]) : undefined);
+
+    if (!to || !resolvedContent) {
+      res.status(400).json({ error: 'to and content (or parts) are required' });
       return;
     }
 
@@ -1180,7 +1301,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
-    if (content.length > config.max_message_length) {
+    if (resolvedContent.length > config.max_message_length) {
       res.status(400).json({ error: `Message too long (max ${config.max_message_length} chars)` });
       return;
     }
@@ -1197,12 +1318,12 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       });
     }
 
-    const msg = db.createMessage(channel.id, req.agent!.id, content, content_type || 'text');
+    const msg = db.createMessage(channel.id, req.agent!.id, resolvedContent, content_type || 'text', partsJson);
 
     // Broadcast
     ws.broadcastMessage(channel.id, msg, req.agent!.name);
 
-    res.json({ channel_id: channel.id, message: msg });
+    res.json({ channel_id: channel.id, message: enrichMessage(msg) });
   });
 
   /**
@@ -1219,7 +1340,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     const messages = db.getNewMessages(req.agent!.id, since);
     const enriched = messages.map(m => {
       const sender = m.sender_id ? db.getAgentById(m.sender_id) : undefined;
-      return { ...m, sender_name: sender?.name || 'unknown' };
+      return { ...enrichMessage(m), sender_name: sender?.name || 'unknown' };
     });
 
     res.json(enriched);
