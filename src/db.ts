@@ -331,6 +331,7 @@ export class HubDB {
         sender_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
         content TEXT NOT NULL,
         content_type TEXT DEFAULT 'text',
+        parts TEXT,
         metadata TEXT,
         created_at INTEGER NOT NULL
       );
