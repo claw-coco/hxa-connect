@@ -22,6 +22,9 @@ import type {
   FileRecord,
   CatchupEvent,
   WebhookHealth,
+  OrgSettings,
+  AuditAction,
+  AuditEntry,
 } from './types.js';
 
 // ─── Database Layer ──────────────────────────────────────────
@@ -184,6 +187,38 @@ export class HubDB {
         consecutive_failures INTEGER DEFAULT 0,
         degraded INTEGER DEFAULT 0
       );
+
+      CREATE TABLE IF NOT EXISTS org_settings (
+        org_id TEXT PRIMARY KEY REFERENCES orgs(id) ON DELETE CASCADE,
+        messages_per_minute_per_bot INTEGER DEFAULT 60,
+        threads_per_hour_per_bot INTEGER DEFAULT 30,
+        message_ttl_days INTEGER,
+        thread_auto_close_days INTEGER,
+        artifact_retention_days INTEGER,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS rate_limit_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        org_id TEXT NOT NULL,
+        bot_id TEXT NOT NULL,
+        resource_type TEXT NOT NULL CHECK(resource_type IN ('message', 'thread')),
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_rate_limit ON rate_limit_events(org_id, bot_id, resource_type, created_at);
+
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL,
+        bot_id TEXT,
+        action TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        detail TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_audit_org ON audit_log(org_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(org_id, action, created_at);
     `);
 
     // Migration: add admin_secret to existing orgs that don't have it
@@ -1745,6 +1780,252 @@ export class HubDB {
     this.db.prepare(`
       UPDATE webhook_status SET degraded = 0, consecutive_failures = 0 WHERE agent_id = ?
     `).run(agentId);
+  }
+
+  // ─── Org Settings Operations ────────────────────────────
+
+  getOrgSettings(orgId: string): OrgSettings {
+    const row = this.db.prepare('SELECT * FROM org_settings WHERE org_id = ?').get(orgId) as any;
+    if (row) {
+      return {
+        org_id: row.org_id,
+        messages_per_minute_per_bot: row.messages_per_minute_per_bot,
+        threads_per_hour_per_bot: row.threads_per_hour_per_bot,
+        message_ttl_days: row.message_ttl_days ?? null,
+        thread_auto_close_days: row.thread_auto_close_days ?? null,
+        artifact_retention_days: row.artifact_retention_days ?? null,
+        updated_at: row.updated_at,
+      };
+    }
+    // Return defaults if no row exists
+    return {
+      org_id: orgId,
+      messages_per_minute_per_bot: 60,
+      threads_per_hour_per_bot: 30,
+      message_ttl_days: null,
+      thread_auto_close_days: null,
+      artifact_retention_days: null,
+      updated_at: 0,
+    };
+  }
+
+  updateOrgSettings(orgId: string, updates: Partial<OrgSettings>): OrgSettings {
+    const now = Date.now();
+    const current = this.getOrgSettings(orgId);
+    const merged: OrgSettings = {
+      org_id: orgId,
+      messages_per_minute_per_bot: updates.messages_per_minute_per_bot ?? current.messages_per_minute_per_bot,
+      threads_per_hour_per_bot: updates.threads_per_hour_per_bot ?? current.threads_per_hour_per_bot,
+      message_ttl_days: updates.message_ttl_days !== undefined ? updates.message_ttl_days : current.message_ttl_days,
+      thread_auto_close_days: updates.thread_auto_close_days !== undefined ? updates.thread_auto_close_days : current.thread_auto_close_days,
+      artifact_retention_days: updates.artifact_retention_days !== undefined ? updates.artifact_retention_days : current.artifact_retention_days,
+      updated_at: now,
+    };
+
+    this.db.prepare(`
+      INSERT INTO org_settings (org_id, messages_per_minute_per_bot, threads_per_hour_per_bot, message_ttl_days, thread_auto_close_days, artifact_retention_days, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(org_id) DO UPDATE SET
+        messages_per_minute_per_bot = excluded.messages_per_minute_per_bot,
+        threads_per_hour_per_bot = excluded.threads_per_hour_per_bot,
+        message_ttl_days = excluded.message_ttl_days,
+        thread_auto_close_days = excluded.thread_auto_close_days,
+        artifact_retention_days = excluded.artifact_retention_days,
+        updated_at = excluded.updated_at
+    `).run(
+      merged.org_id,
+      merged.messages_per_minute_per_bot,
+      merged.threads_per_hour_per_bot,
+      merged.message_ttl_days,
+      merged.thread_auto_close_days,
+      merged.artifact_retention_days,
+      merged.updated_at,
+    );
+
+    return merged;
+  }
+
+  // ─── Rate Limiting Operations ─────────────────────────────
+
+  checkRateLimit(orgId: string, botId: string, resource: 'message' | 'thread'): { allowed: boolean; retryAfter?: number } {
+    const settings = this.getOrgSettings(orgId);
+    const now = Date.now();
+
+    if (resource === 'message') {
+      const windowStart = now - 60000; // 1 minute
+      const row = this.db.prepare(
+        `SELECT COUNT(*) as count, MIN(created_at) as oldest FROM rate_limit_events
+         WHERE org_id = ? AND bot_id = ? AND resource_type = 'message' AND created_at > ?`
+      ).get(orgId, botId, windowStart) as { count: number; oldest: number | null };
+
+      if (row.count >= settings.messages_per_minute_per_bot) {
+        const retryAfter = row.oldest ? Math.ceil((row.oldest + 60000 - now) / 1000) : 60;
+        return { allowed: false, retryAfter: Math.max(retryAfter, 1) };
+      }
+    } else {
+      const windowStart = now - 3600000; // 1 hour
+      const row = this.db.prepare(
+        `SELECT COUNT(*) as count, MIN(created_at) as oldest FROM rate_limit_events
+         WHERE org_id = ? AND bot_id = ? AND resource_type = 'thread' AND created_at > ?`
+      ).get(orgId, botId, windowStart) as { count: number; oldest: number | null };
+
+      if (row.count >= settings.threads_per_hour_per_bot) {
+        const retryAfter = row.oldest ? Math.ceil((row.oldest + 3600000 - now) / 1000) : 3600;
+        return { allowed: false, retryAfter: Math.max(retryAfter, 1) };
+      }
+    }
+
+    return { allowed: true };
+  }
+
+  recordRateLimitEvent(orgId: string, botId: string, resource: 'message' | 'thread'): void {
+    this.db.prepare(
+      'INSERT INTO rate_limit_events (org_id, bot_id, resource_type, created_at) VALUES (?, ?, ?, ?)'
+    ).run(orgId, botId, resource, Date.now());
+  }
+
+  cleanupOldRateLimitEvents(): void {
+    const cutoff = Date.now() - 3600000; // 1 hour
+    this.db.prepare('DELETE FROM rate_limit_events WHERE created_at < ?').run(cutoff);
+  }
+
+  // ─── Audit Log Operations ─────────────────────────────────
+
+  recordAudit(
+    orgId: string,
+    botId: string | null,
+    action: AuditAction,
+    targetType: string,
+    targetId: string,
+    detail?: Record<string, unknown>,
+  ): void {
+    const id = crypto.randomUUID();
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO audit_log (id, org_id, bot_id, action, target_type, target_id, detail, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, orgId, botId, action, targetType, targetId, detail ? JSON.stringify(detail) : null, now);
+  }
+
+  getAuditLog(orgId: string, filters?: {
+    since?: number;
+    action?: string;
+    target_type?: string;
+    target_id?: string;
+    bot_id?: string;
+    limit?: number;
+  }): AuditEntry[] {
+    const where: string[] = ['org_id = ?'];
+    const params: any[] = [orgId];
+
+    if (filters?.since) {
+      where.push('created_at > ?');
+      params.push(filters.since);
+    }
+    if (filters?.action) {
+      where.push('action = ?');
+      params.push(filters.action);
+    }
+    if (filters?.target_type) {
+      where.push('target_type = ?');
+      params.push(filters.target_type);
+    }
+    if (filters?.target_id) {
+      where.push('target_id = ?');
+      params.push(filters.target_id);
+    }
+    if (filters?.bot_id) {
+      where.push('bot_id = ?');
+      params.push(filters.bot_id);
+    }
+
+    const limit = Math.min(Math.max(filters?.limit || 50, 1), 200);
+    params.push(limit);
+
+    const rows = this.db.prepare(`
+      SELECT * FROM audit_log
+      WHERE ${where.join(' AND ')}
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(...params) as any[];
+
+    return rows.map(row => ({
+      id: row.id,
+      org_id: row.org_id,
+      bot_id: row.bot_id ?? null,
+      action: row.action as AuditAction,
+      target_type: row.target_type,
+      target_id: row.target_id,
+      detail: row.detail ? JSON.parse(row.detail) : null,
+      created_at: row.created_at,
+    }));
+  }
+
+  cleanupOldAuditLog(maxAgeDays: number): void {
+    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+    this.db.prepare('DELETE FROM audit_log WHERE created_at < ?').run(cutoff);
+  }
+
+  // ─── TTL / Lifecycle Cleanup Operations ────────────────────
+
+  cleanupExpiredMessages(orgId: string, ttlDays: number): void {
+    const cutoff = Date.now() - ttlDays * 24 * 60 * 60 * 1000;
+
+    // Delete channel messages older than TTL
+    this.db.prepare(`
+      DELETE FROM messages WHERE channel_id IN (
+        SELECT id FROM channels WHERE org_id = ?
+      ) AND created_at < ?
+    `).run(orgId, cutoff);
+
+    // Delete thread messages older than TTL
+    this.db.prepare(`
+      DELETE FROM thread_messages WHERE thread_id IN (
+        SELECT id FROM threads WHERE org_id = ?
+      ) AND created_at < ?
+    `).run(orgId, cutoff);
+  }
+
+  autoCloseInactiveThreads(orgId: string, days: number): void {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    this.db.prepare(`
+      UPDATE threads SET status = 'closed', close_reason = 'timeout', updated_at = ?, last_activity_at = ?
+      WHERE org_id = ? AND last_activity_at < ? AND status NOT IN ('resolved', 'closed')
+    `).run(now, now, orgId, cutoff);
+  }
+
+  cleanupExpiredArtifacts(orgId: string, days: number): void {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    this.db.prepare(`
+      DELETE FROM artifacts WHERE thread_id IN (
+        SELECT id FROM threads WHERE org_id = ? AND status IN ('resolved', 'closed')
+      ) AND created_at < ?
+    `).run(orgId, cutoff);
+  }
+
+  runLifecycleCleanup(): void {
+    const orgs = this.listOrgs();
+    for (const org of orgs) {
+      const settings = this.getOrgSettings(org.id);
+
+      if (settings.message_ttl_days !== null && settings.message_ttl_days > 0) {
+        this.cleanupExpiredMessages(org.id, settings.message_ttl_days);
+      }
+
+      if (settings.thread_auto_close_days !== null && settings.thread_auto_close_days > 0) {
+        this.autoCloseInactiveThreads(org.id, settings.thread_auto_close_days);
+      }
+
+      if (settings.artifact_retention_days !== null && settings.artifact_retention_days > 0) {
+        this.cleanupExpiredArtifacts(org.id, settings.artifact_retention_days);
+      }
+    }
+
+    // Global cleanups
+    this.cleanupOldCatchupEvents(30);
+    this.cleanupOldAuditLog(90);
+    this.cleanupOldRateLimitEvents();
   }
 
   close() {

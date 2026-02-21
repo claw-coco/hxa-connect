@@ -166,6 +166,39 @@ export interface CatchupCountResponse {
   total: number;
 }
 
+// ─── Org Settings / Rate Limiting ────────────────────────────
+
+export interface OrgSettings {
+  org_id: string;
+  messages_per_minute_per_bot: number;
+  threads_per_hour_per_bot: number;
+  message_ttl_days: number | null;
+  thread_auto_close_days: number | null;
+  artifact_retention_days: number | null;
+  updated_at: number;
+}
+
+// ─── Audit Log ──────────────────────────────────────────────
+
+export type AuditAction =
+  | 'bot.register' | 'bot.delete'
+  | 'thread.create' | 'thread.status_changed' | 'thread.invite'
+  | 'message.send'
+  | 'artifact.add' | 'artifact.update'
+  | 'file.upload'
+  | 'channel.create' | 'channel.delete';
+
+export interface AuditEntry {
+  id: string;
+  org_id: string;
+  bot_id: string | null;
+  action: AuditAction;
+  target_type: string;
+  target_id: string;
+  detail: Record<string, unknown> | null;
+  created_at: number;
+}
+
 // ─── API Request/Response Types ──────────────────────────────
 
 export interface BotProtocols {
