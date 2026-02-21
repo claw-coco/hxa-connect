@@ -19,6 +19,7 @@ import type {
   ThreadType,
   ThreadStatus,
   CloseReason,
+  CatchupEvent,
 } from './types.js';
 
 // ─── Database Layer ──────────────────────────────────────────
@@ -151,6 +152,16 @@ export class HubDB {
       CREATE INDEX IF NOT EXISTS idx_thread_participants_bot ON thread_participants(bot_id);
       CREATE INDEX IF NOT EXISTS idx_thread_messages ON thread_messages(thread_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_artifacts_thread ON artifacts(thread_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS catchup_events (
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL,
+        target_bot_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        occurred_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_catchup_target ON catchup_events(target_bot_id, occurred_at);
     `);
 
     // Migration: add admin_secret to existing orgs that don't have it
@@ -1442,6 +1453,118 @@ export class HubDB {
     `).all(threadId, key) as any[];
 
     return rows.map(row => this.rowToArtifact(row));
+  }
+
+  // ─── Catchup Event Operations ─────────────────────────────
+
+  recordCatchupEvent(orgId: string, targetBotId: string, type: string, payload: Record<string, unknown>) {
+    const id = crypto.randomUUID();
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO catchup_events (id, org_id, target_bot_id, type, payload, occurred_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, orgId, targetBotId, type, JSON.stringify(payload), now);
+  }
+
+  getCatchupEvents(botId: string, since: number, limit = 50, cursor?: string): { events: CatchupEvent[]; has_more: boolean } {
+    let rows: any[];
+
+    if (cursor) {
+      // Cursor is the last event_id from previous page — get its occurred_at for efficient seek
+      const cursorRow = this.db.prepare(
+        'SELECT occurred_at FROM catchup_events WHERE id = ?'
+      ).get(cursor) as { occurred_at: number } | undefined;
+
+      if (cursorRow) {
+        // Events after the cursor: same timestamp but later ID, or later timestamp
+        rows = this.db.prepare(`
+          SELECT * FROM catchup_events
+          WHERE target_bot_id = ? AND occurred_at >= ? AND (occurred_at > ? OR id > ?)
+          ORDER BY occurred_at ASC, id ASC
+          LIMIT ?
+        `).all(botId, since, cursorRow.occurred_at, cursor, limit + 1) as any[];
+      } else {
+        // Invalid cursor — fall back to since-only query
+        rows = this.db.prepare(`
+          SELECT * FROM catchup_events
+          WHERE target_bot_id = ? AND occurred_at > ?
+          ORDER BY occurred_at ASC, id ASC
+          LIMIT ?
+        `).all(botId, since, limit + 1) as any[];
+      }
+    } else {
+      rows = this.db.prepare(`
+        SELECT * FROM catchup_events
+        WHERE target_bot_id = ? AND occurred_at > ?
+        ORDER BY occurred_at ASC, id ASC
+        LIMIT ?
+      `).all(botId, since, limit + 1) as any[];
+    }
+
+    const has_more = rows.length > limit;
+    if (has_more) rows = rows.slice(0, limit);
+
+    const events: CatchupEvent[] = rows.map(row => {
+      const payload = JSON.parse(row.payload as string) as Record<string, unknown>;
+      return {
+        event_id: row.id as string,
+        occurred_at: row.occurred_at as number,
+        type: row.type,
+        ...payload,
+      } as CatchupEvent;
+    });
+
+    return { events, has_more };
+  }
+
+  getCatchupCount(botId: string, since: number): {
+    thread_invites: number;
+    thread_status_changes: number;
+    thread_activities: number;
+    channel_messages: number;
+    total: number;
+  } {
+    const rows = this.db.prepare(`
+      SELECT type, COUNT(*) as count FROM catchup_events
+      WHERE target_bot_id = ? AND occurred_at > ?
+      GROUP BY type
+    `).all(botId, since) as { type: string; count: number }[];
+
+    const counts = {
+      thread_invites: 0,
+      thread_status_changes: 0,
+      thread_activities: 0,
+      channel_messages: 0,
+      total: 0,
+    };
+
+    for (const row of rows) {
+      switch (row.type) {
+        case 'thread_invited':
+          counts.thread_invites = row.count;
+          break;
+        case 'thread_status_changed':
+          counts.thread_status_changes = row.count;
+          break;
+        case 'thread_message_summary':
+        case 'thread_artifact_added':
+          counts.thread_activities += row.count;
+          break;
+        case 'channel_message_summary':
+          counts.channel_messages = row.count;
+          break;
+      }
+    }
+
+    counts.total = counts.thread_invites + counts.thread_status_changes
+      + counts.thread_activities + counts.channel_messages;
+
+    return counts;
+  }
+
+  cleanupOldCatchupEvents(maxAgeDays: number) {
+    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+    this.db.prepare('DELETE FROM catchup_events WHERE occurred_at < ?').run(cutoff);
   }
 
   close() {

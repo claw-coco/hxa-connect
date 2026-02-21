@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { HubDB } from './db.js';
 import type { HubWS } from './ws.js';
 import { authMiddleware, requireAgent, requireOrg } from './auth.js';
-import type { HubConfig, Agent, AgentProfileInput, Thread, ThreadStatus, ThreadType, CloseReason, ArtifactType } from './types.js';
+import type { HubConfig, Agent, AgentProfileInput, Thread, ThreadStatus, ThreadType, CloseReason, ArtifactType, CatchupResponse, CatchupCountResponse } from './types.js';
 
 function parseJsonField<T>(value: string | null): T | null {
   if (!value) return null;
@@ -605,6 +605,17 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
         contextJson,
       );
 
+      // Record catchup events: thread_invited for each participant (except initiator)
+      const allParticipantIds = Array.from(new Set([req.agent!.id, ...resolvedParticipantIds]));
+      for (const pid of allParticipantIds) {
+        if (pid === req.agent!.id) continue;
+        db.recordCatchupEvent(orgId, pid, 'thread_invited', {
+          thread_id: thread.id,
+          topic: thread.topic,
+          inviter: req.agent!.id,
+        });
+      }
+
       ws.broadcastThreadEvent(orgId, thread.id, {
         type: 'thread_created',
         thread,
@@ -722,6 +733,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
     try {
       if (status !== undefined) {
+        const previousStatus = thread.status;
         updated = db.updateThreadStatus(thread.id, status, closeReason);
         if (!updated) {
           res.status(404).json({ error: 'Thread not found' });
@@ -730,6 +742,18 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
         changes.push('status');
         if (status === 'closed') changes.push('close_reason');
         if (status === 'resolved') changes.push('resolved_at');
+
+        // Record catchup event for all participants
+        const participants = db.getParticipants(thread.id);
+        for (const p of participants) {
+          db.recordCatchupEvent(thread.org_id, p.bot_id, 'thread_status_changed', {
+            thread_id: thread.id,
+            topic: thread.topic,
+            from: previousStatus,
+            to: status,
+            by: req.agent!.id,
+          });
+        }
       }
 
       if (context !== undefined) {
@@ -788,6 +812,13 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       const participant = db.addParticipant(thread.id, bot.id, label);
 
       if (!alreadyParticipant) {
+        // Record catchup event for the invited bot
+        db.recordCatchupEvent(thread.org_id, bot.id, 'thread_invited', {
+          thread_id: thread.id,
+          topic: thread.topic,
+          inviter: req.agent!.id,
+        });
+
         ws.broadcastThreadEvent(thread.org_id, thread.id, {
           type: 'thread_participant',
           thread_id: thread.id,
@@ -892,6 +923,18 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       metadataJson,
     );
 
+    // Record catchup events for all participants except the sender
+    const participants = db.getParticipants(thread.id);
+    for (const p of participants) {
+      if (p.bot_id === req.agent!.id) continue;
+      db.recordCatchupEvent(thread.org_id, p.bot_id, 'thread_message_summary', {
+        thread_id: thread.id,
+        topic: thread.topic,
+        count: 1,
+        last_at: message.created_at,
+      });
+    }
+
     ws.broadcastThreadEvent(thread.org_id, thread.id, {
       type: 'thread_message',
       thread_id: thread.id,
@@ -989,6 +1032,17 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
         mime_type === undefined ? undefined : (mime_type ?? null),
       );
 
+      // Record catchup events for all participants except the contributor
+      const participants = db.getParticipants(thread.id);
+      for (const p of participants) {
+        if (p.bot_id === req.agent!.id) continue;
+        db.recordCatchupEvent(thread.org_id, p.bot_id, 'thread_artifact_added', {
+          thread_id: thread.id,
+          artifact_key: artifact.artifact_key,
+          version: artifact.version,
+        });
+      }
+
       ws.broadcastThreadEvent(thread.org_id, thread.id, {
         type: 'thread_artifact',
         thread_id: thread.id,
@@ -1042,6 +1096,17 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       if (!artifact) {
         res.status(404).json({ error: 'Artifact not found' });
         return;
+      }
+
+      // Record catchup events for all participants except the contributor
+      const participants = db.getParticipants(thread.id);
+      for (const p of participants) {
+        if (p.bot_id === req.agent!.id) continue;
+        db.recordCatchupEvent(thread.org_id, p.bot_id, 'thread_artifact_added', {
+          thread_id: thread.id,
+          artifact_key: artifact.artifact_key,
+          version: artifact.version,
+        });
       }
 
       ws.broadcastThreadEvent(thread.org_id, thread.id, {
@@ -1113,6 +1178,18 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     }
 
     const msg = db.createMessage(channel.id, req.agent!.id, content, content_type || 'text');
+
+    // Record catchup events for all channel members except the sender
+    const members = db.getChannelMembers(channel.id);
+    for (const m of members) {
+      if (m.agent_id === req.agent!.id) continue;
+      db.recordCatchupEvent(channel.org_id, m.agent_id, 'channel_message_summary', {
+        channel_id: channel.id,
+        channel_name: channel.name ?? undefined,
+        count: 1,
+        last_at: msg.created_at,
+      });
+    }
 
     // Broadcast via WebSocket
     ws.broadcastMessage(channel.id, msg, req.agent!.name);
@@ -1199,11 +1276,69 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
     const msg = db.createMessage(channel.id, req.agent!.id, content, content_type || 'text');
 
+    // Record catchup event for the target
+    db.recordCatchupEvent(req.agent!.org_id, target.id, 'channel_message_summary', {
+      channel_id: channel.id,
+      channel_name: channel.name ?? undefined,
+      count: 1,
+      last_at: msg.created_at,
+    });
+
     // Broadcast
     ws.broadcastMessage(channel.id, msg, req.agent!.name);
 
     res.json({ channel_id: channel.id, message: msg });
   });
+
+  // ─── Catchup (Offline Event Replay) ───────────────────────
+
+  /**
+   * GET /api/me/catchup — Get missed events since timestamp
+   * Query: since (required, ms timestamp), cursor?, limit?
+   */
+  auth.get('/api/me/catchup', requireAgent, (req, res) => {
+    const sinceStr = getQueryString(req.query.since);
+    const since = sinceStr ? parseInt(sinceStr) : NaN;
+    if (isNaN(since)) {
+      res.status(400).json({ error: 'since (timestamp) is required' });
+      return;
+    }
+
+    const limitRaw = parseInt(getQueryString(req.query.limit) || '') || 50;
+    const limit = Math.min(Math.max(limitRaw, 1), 200);
+    const cursor = getQueryString(req.query.cursor);
+
+    const { events, has_more } = db.getCatchupEvents(req.agent!.id, since, limit, cursor);
+
+    const response: CatchupResponse = {
+      events,
+      has_more,
+    };
+
+    if (has_more && events.length > 0) {
+      response.cursor = events[events.length - 1].event_id;
+    }
+
+    res.json(response);
+  });
+
+  /**
+   * GET /api/me/catchup/count — Get count of missed events by type
+   * Query: since (required, ms timestamp)
+   */
+  auth.get('/api/me/catchup/count', requireAgent, (req, res) => {
+    const sinceStr = getQueryString(req.query.since);
+    const since = sinceStr ? parseInt(sinceStr) : NaN;
+    if (isNaN(since)) {
+      res.status(400).json({ error: 'since (timestamp) is required' });
+      return;
+    }
+
+    const counts: CatchupCountResponse = db.getCatchupCount(req.agent!.id, since);
+    res.json(counts);
+  });
+
+  // ─── Inbox ─────────────────────────────────────────────────
 
   /**
    * GET /api/inbox — Get new messages since timestamp
