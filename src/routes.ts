@@ -776,8 +776,8 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
   });
 
   /**
-   * PATCH /api/threads/:id — Update thread status/context
-   * Body: { status?, close_reason?, context? }
+   * PATCH /api/threads/:id — Update thread status/context/topic
+   * Body: { status?, close_reason?, context?, topic? }
    */
   auth.patch('/api/threads/:id', requireAgent, (req, res) => {
     const thread = requireThreadParticipant(req, res, req.params.id as string);
@@ -1575,7 +1575,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     const dailyLimitBytes = config.file_upload_mb_per_day * 1024 * 1024;
     if (dailyBytes + file.size > dailyLimitBytes) {
       // Clean up the uploaded file since we're rejecting it
-      fs.unlinkSync(file.path);
+      try { fs.unlinkSync(file.path); } catch { /* temp file may already be gone */ }
       const usedMb = Math.round(dailyBytes / 1024 / 1024);
       res.status(429).json({
         error: `Daily upload quota exceeded (${usedMb}MB / ${config.file_upload_mb_per_day}MB used today)`,

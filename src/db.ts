@@ -273,6 +273,9 @@ export class HubDB {
     // SQLite cannot ALTER FK constraints, so we must recreate tables.
     this.migrateThreadForeignKeys();
 
+    // Migration: fix files.uploader_id NOT NULL → nullable for ON DELETE SET NULL
+    this.migrateFilesForeignKey();
+
     // Generate admin_secret for orgs that don't have one
     const orgsWithoutSecret = this.db.prepare('SELECT id FROM orgs WHERE admin_secret IS NULL').all() as any[];
     for (const org of orgsWithoutSecret) {
@@ -368,6 +371,39 @@ export class HubDB {
 
     this.db.pragma('foreign_keys = ON');
     console.log('  ✅ Thread FK migration complete');
+  }
+
+  private migrateFilesForeignKey() {
+    const filesInfo = this.db.pragma('table_info(files)') as any[];
+    if (filesInfo.length === 0) return; // table doesn't exist yet (fresh install)
+
+    const uploaderCol = filesInfo.find((c: any) => c.name === 'uploader_id');
+    if (!uploaderCol || uploaderCol.notnull === 0) return; // already nullable = already migrated
+
+    console.log('  🔧 Migrating files table: uploader_id NOT NULL → nullable...');
+
+    this.db.pragma('foreign_keys = OFF');
+
+    this.db.exec(`
+      CREATE TABLE files_new (
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+        uploader_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+        name TEXT NOT NULL,
+        mime_type TEXT,
+        size INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO files_new SELECT * FROM files;
+      DROP TABLE files;
+      ALTER TABLE files_new RENAME TO files;
+
+      CREATE INDEX IF NOT EXISTS idx_files_org ON files(org_id, created_at);
+    `);
+
+    this.db.pragma('foreign_keys = ON');
+    console.log('  ✅ Files FK migration complete');
   }
 
   private rowToOrg(row: any): Org {
@@ -1540,7 +1576,7 @@ export class HubDB {
 
   getDailyUploadBytes(orgId: string): number {
     const dayStart = new Date();
-    dayStart.setHours(0, 0, 0, 0);
+    dayStart.setUTCHours(0, 0, 0, 0);
     const row = this.db.prepare(
       'SELECT COALESCE(SUM(size), 0) as total FROM files WHERE org_id = ? AND created_at >= ?'
     ).get(orgId, dayStart.getTime()) as { total: number };
