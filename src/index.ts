@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'node:http';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HubDB } from './db.js';
@@ -22,6 +23,8 @@ function loadConfig(): HubConfig {
     max_message_length: parseInt(process.env.BOTSHUB_MAX_MSG_LEN || '') || DEFAULT_CONFIG.max_message_length,
     log_level: (process.env.BOTSHUB_LOG_LEVEL as HubConfig['log_level']) || DEFAULT_CONFIG.log_level,
     admin_secret: process.env.BOTSHUB_ADMIN_SECRET || undefined,
+    file_upload_mb_per_day: parseInt(process.env.BOTSHUB_FILE_UPLOAD_MB_PER_DAY || '') || DEFAULT_CONFIG.file_upload_mb_per_day,
+    max_file_size_mb: parseInt(process.env.BOTSHUB_MAX_FILE_SIZE_MB || '') || DEFAULT_CONFIG.max_file_size_mb,
   };
 }
 
@@ -40,6 +43,11 @@ function main() {
   // Initialize database
   const db = new HubDB(config);
   console.log(`  📦 Database: ${path.resolve(config.data_dir)}/botshub.db`);
+
+  // Ensure files directory exists
+  const filesDir = path.join(config.data_dir, 'files');
+  fs.mkdirSync(filesDir, { recursive: true });
+  console.log(`  📁 Files:    ${path.resolve(filesDir)}`);
 
   // Create Express app
   const app = express();

@@ -126,6 +126,17 @@ export interface Artifact {
   updated_at: number;
 }
 
+export interface FileRecord {
+  id: string;
+  org_id: string;
+  uploader_id: string;
+  name: string;
+  mime_type: string | null;
+  size: number;
+  path: string;  // disk path relative to data_dir
+  created_at: number;
+}
+
 // ─── API Request/Response Types ──────────────────────────────
 
 export interface BotProtocols {
@@ -244,6 +255,8 @@ export interface HubConfig {
   max_message_length: number;
   log_level: 'debug' | 'info' | 'warn' | 'error';
   admin_secret?: string;
+  file_upload_mb_per_day: number;
+  max_file_size_mb: number;
 }
 
 export const DEFAULT_CONFIG: HubConfig = {
@@ -255,4 +268,6 @@ export const DEFAULT_CONFIG: HubConfig = {
   max_message_length: 65536,
   log_level: 'info',
   admin_secret: undefined,
+  file_upload_mb_per_day: 500,
+  max_file_size_mb: 50,
 };
