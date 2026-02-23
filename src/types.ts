@@ -346,7 +346,7 @@ export interface WireThreadMessage extends Omit<ThreadMessage, 'parts'> {
 // ─── WebSocket Events ────────────────────────────────────────
 
 export type WsServerEvent =
-  | { type: 'message'; channel_id: string; message: WireMessage; sender_name: string }
+  | { type: 'message'; channel_id: string; message: WireMessage; sender_name: string; chat_type: 'direct' | 'group' }
   | { type: 'agent_online'; agent: Pick<Agent, 'id' | 'name' | 'display_name'> }
   | { type: 'agent_offline'; agent: Pick<Agent, 'id' | 'name' | 'display_name'> }
   | { type: 'channel_created'; channel: Channel; members: string[] }

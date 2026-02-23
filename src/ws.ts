@@ -216,6 +216,7 @@ export class HubWS {
       channel_id: channelId,
       message: wireMessage,
       sender_name: senderName,
+      chat_type: channel.type,
     };
 
     // Fire webhooks for members who have one (and aren't the sender)
