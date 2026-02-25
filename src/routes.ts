@@ -4,9 +4,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { HubDB } from './db.js';
+import { HubDB } from './db.js';
 import type { HubWS } from './ws.js';
-import { authMiddleware, requireAgent, requireOrg, requireScope } from './auth.js';
+import { authMiddleware, requireAgent, requireOrg, requireScope, requireAuthRole } from './auth.js';
 import { validateWebhookUrl } from './webhook.js';
 import { validateParts, VALID_TOKEN_SCOPES, type HubConfig, type Agent, type AgentProfileInput, type Thread, type ThreadStatus, type CloseReason, type ArtifactType, type MessagePart, type Message, type ThreadMessage, type WireMessage, type WireThreadMessage, type CatchupResponse, type CatchupCountResponse, type OrgSettings, type TokenScope, type ThreadPermissionPolicy } from './types.js';
 import { issueWsTicket } from './ws-tickets.js';
@@ -61,6 +61,7 @@ function toAgentResponse(agent: Agent) {
     org_id: agent.org_id,
     name: agent.name,
     display_name: agent.display_name,
+    auth_role: agent.auth_role,
     online: agent.online,
     last_seen_at: agent.last_seen_at,
     created_at: agent.created_at,
@@ -291,6 +292,277 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     if (!requireAdmin(req, res)) return;
     const orgs = db.listOrgs().map(({ api_key, admin_secret, ...safe }) => safe);
     res.json(orgs);
+  });
+
+  // ─── Shared Registration Validation ───────────────────────
+
+  /**
+   * Validate and extract agent registration fields from a request body.
+   * Returns the validated fields or sends an error response and returns null.
+   */
+  async function validateRegistrationBody(
+    body: any,
+    res: import('express').Response,
+  ): Promise<{
+    name: string;
+    display_name?: string;
+    metadata?: Record<string, unknown> | null;
+    webhook_url?: string | null;
+    webhook_secret?: string | null;
+    profile: AgentProfileInput;
+  } | null> {
+    const {
+      name,
+      display_name,
+      metadata,
+      webhook_url,
+      webhook_secret,
+      bio,
+      role,
+      function: functionName,
+      team,
+      tags,
+      languages,
+      protocols,
+      status_text,
+      timezone,
+      active_hours,
+      version,
+      runtime,
+    } = body;
+
+    if (!name) {
+      res.status(400).json({ error: 'name is required', code: 'VALIDATION_ERROR' });
+      return null;
+    }
+
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+      res.status(400).json({ error: 'name must be alphanumeric (a-z, 0-9, _, -)', code: 'VALIDATION_ERROR' });
+      return null;
+    }
+
+    // Per-field size limits
+    const fieldError = checkFieldLimits({ name, display_name, metadata, webhook_url, bio, role, function: functionName, team, tags, languages, protocols, status_text, timezone, active_hours, version, runtime });
+    if (fieldError) {
+      res.status(400).json({ error: fieldError });
+      return null;
+    }
+
+    // Validate profile field types
+    const stringFields = { bio, role, function: functionName, team, status_text, timezone, active_hours, version, runtime };
+    for (const [key, val] of Object.entries(stringFields)) {
+      if (val !== undefined && val !== null && typeof val !== 'string') {
+        res.status(400).json({ error: `${key} must be a string or null` });
+        return null;
+      }
+    }
+    for (const [key, val] of Object.entries({ tags, languages }) as [string, unknown][]) {
+      if (val !== undefined && val !== null && (!Array.isArray(val) || !val.every((v: unknown) => typeof v === 'string'))) {
+        res.status(400).json({ error: `${key} must be an array of strings or null` });
+        return null;
+      }
+    }
+    if (protocols !== undefined && protocols !== null && typeof protocols !== 'object') {
+      res.status(400).json({ error: 'protocols must be an object or null' });
+      return null;
+    }
+
+    const profile: AgentProfileInput = {
+      bio,
+      role,
+      function: functionName,
+      team,
+      tags,
+      languages,
+      protocols,
+      status_text,
+      timezone,
+      active_hours,
+      version,
+      runtime,
+    };
+
+    // SSRF protection: validate webhook URL at set time
+    if (webhook_url) {
+      const urlError = await validateWebhookUrl(webhook_url);
+      if (urlError) {
+        res.status(400).json({ error: urlError });
+        return null;
+      }
+    }
+
+    return { name, display_name, metadata, webhook_url, webhook_secret, profile };
+  }
+
+  // ─── Public Auth Routes (Ticket-Based) ──────────────────
+
+  /**
+   * POST /api/auth/login — Authenticate with org credentials and receive a ticket
+   * Body: { org_id, org_secret, reusable?, expires_in? }
+   * Returns: { ticket, expires_at, reusable, org: { id, name } }
+   */
+  router.post('/api/auth/login', (req, res) => {
+    const { org_id, org_secret, reusable, expires_in } = req.body;
+
+    // Validate required fields
+    if (!org_id || typeof org_id !== 'string') {
+      res.status(400).json({ error: 'org_id is required', code: 'VALIDATION_ERROR' });
+      return;
+    }
+    if (!org_secret || typeof org_secret !== 'string') {
+      res.status(400).json({ error: 'org_secret is required', code: 'VALIDATION_ERROR' });
+      return;
+    }
+
+    // Look up org
+    const org = db.getOrgById(org_id);
+    if (!org) {
+      res.status(404).json({ error: 'Organization not found', code: 'NOT_FOUND' });
+      return;
+    }
+
+    // Verify org_secret
+    if (!db.verifyOrgSecret(org.id, org_secret)) {
+      res.status(401).json({ error: 'Invalid org secret', code: 'INVALID_SECRET' });
+      return;
+    }
+
+    // Check org status
+    if (org.status !== 'active') {
+      const code = org.status === 'suspended' ? 'ORG_SUSPENDED' : 'ORG_DESTROYED';
+      res.status(403).json({ error: `Organization is ${org.status}`, code });
+      return;
+    }
+
+    // Calculate expiry
+    const expiresInSec = typeof expires_in === 'number' && expires_in > 0 ? expires_in : 1800;
+    const expiresAt = Date.now() + expiresInSec * 1000;
+
+    // Store the hash of the plaintext org_secret in the ticket for rotation binding
+    const secretHash = HubDB.hashToken(org_secret);
+
+    const isReusable = reusable === true;
+    const ticket = db.createOrgTicket(org.id, secretHash, {
+      reusable: isReusable,
+      expiresAt,
+      createdBy: 'login',
+    });
+
+    res.json({
+      ticket: ticket.id,
+      expires_at: ticket.expires_at,
+      reusable: ticket.reusable,
+      org: { id: org.id, name: org.name },
+    });
+  });
+
+  /**
+   * POST /api/auth/register — Register an agent using a ticket (no Bearer auth needed)
+   * Body: { org_id, ticket, name, display_name?, ...profile fields }
+   * Returns: { agent_id, token, name, auth_role }
+   */
+  router.post('/api/auth/register', async (req, res) => {
+    const { org_id, ticket: ticketId } = req.body;
+
+    // Validate required fields
+    if (!org_id || typeof org_id !== 'string') {
+      res.status(400).json({ error: 'org_id is required', code: 'VALIDATION_ERROR' });
+      return;
+    }
+    if (!ticketId || typeof ticketId !== 'string') {
+      res.status(400).json({ error: 'ticket is required', code: 'VALIDATION_ERROR' });
+      return;
+    }
+
+    // Validate registration body fields
+    const validated = await validateRegistrationBody(req.body, res);
+    if (!validated) return; // response already sent
+
+    // Get and validate the ticket
+    const ticket = db.getOrgTicket(ticketId);
+    if (!ticket) {
+      res.status(401).json({ error: 'Invalid ticket', code: 'INVALID_TICKET' });
+      return;
+    }
+
+    // Check ticket belongs to this org
+    if (ticket.org_id !== org_id) {
+      res.status(401).json({ error: 'Invalid ticket', code: 'INVALID_TICKET' });
+      return;
+    }
+
+    // Check not expired
+    if (ticket.expires_at <= Date.now()) {
+      res.status(401).json({ error: 'Ticket expired', code: 'TICKET_EXPIRED' });
+      return;
+    }
+
+    // Check not already consumed (for one-time tickets)
+    if (!ticket.reusable && ticket.consumed) {
+      res.status(401).json({ error: 'Ticket already consumed', code: 'TICKET_CONSUMED' });
+      return;
+    }
+
+    // Redeem the ticket (atomic consume for one-time tickets)
+    if (!ticket.reusable) {
+      const redeemed = db.redeemOrgTicket(ticketId);
+      if (!redeemed) {
+        res.status(401).json({ error: 'Ticket already consumed', code: 'TICKET_CONSUMED' });
+        return;
+      }
+    }
+
+    // Get org and check status
+    const org = db.getOrgById(org_id);
+    if (!org) {
+      res.status(404).json({ error: 'Organization not found', code: 'NOT_FOUND' });
+      return;
+    }
+    if (org.status !== 'active') {
+      const code = org.status === 'suspended' ? 'ORG_SUSPENDED' : 'ORG_DESTROYED';
+      res.status(403).json({ error: `Organization is ${org.status}`, code });
+      return;
+    }
+
+    // First-agent auto-admin
+    const existingAgents = db.listAgents(org_id);
+    const authRole: 'admin' | 'member' = existingAgents.length === 0 ? 'admin' : 'member';
+
+    // Register the agent
+    const { agent, created, plaintextToken } = db.registerAgent(
+      org_id,
+      validated.name,
+      validated.display_name,
+      validated.metadata,
+      validated.webhook_url,
+      validated.webhook_secret,
+      validated.profile,
+    );
+
+    // Set auth_role (registerAgent defaults to 'member', override if first agent)
+    if (authRole === 'admin' && created) {
+      db.setAgentAuthRole(agent.id, 'admin');
+      agent.auth_role = 'admin';
+    }
+
+    // Audit
+    db.recordAudit(org_id, agent.id, 'bot.register', 'agent', agent.id, { name: agent.name, reregister: !created, via: 'ticket' });
+
+    // Broadcast agent online
+    ws.broadcastToOrg(org_id, {
+      type: 'agent_online',
+      agent: { id: agent.id, name: agent.name, display_name: agent.display_name },
+    });
+
+    const response: Record<string, unknown> = {
+      agent_id: agent.id,
+      ...toAgentResponse(agent),
+    };
+    // Only include token on initial registration
+    if (created && plaintextToken !== null) {
+      response.token = plaintextToken;
+    }
+    res.json(response);
   });
 
   // ─── Authenticated Routes ─────────────────────────────────
@@ -2348,6 +2620,112 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     db.recordAudit(req.org!.id, null, 'settings.update', 'org_settings', req.org!.id, updates);
 
     res.json(settings);
+  });
+
+  // ─── Org Auth Management (Admin Agent) ─────────────────────
+
+  /**
+   * POST /api/org/tickets — Create an org ticket (admin agents only)
+   * Auth: Agent token (admin role)
+   * Body: { reusable?: boolean, expires_in?: number }
+   * Returns: { ticket, expires_at, reusable }
+   */
+  auth.post('/api/org/tickets', requireAgent, requireAuthRole('admin'), (req, res) => {
+    const { reusable, expires_in } = req.body;
+
+    const orgId = req.agent!.org_id;
+    const org = db.getOrgById(orgId);
+    if (!org) {
+      res.status(404).json({ error: 'Organization not found', code: 'NOT_FOUND' });
+      return;
+    }
+
+    // Calculate expiry
+    const expiresInSec = typeof expires_in === 'number' && expires_in > 0 ? expires_in : 1800;
+    const expiresAt = Date.now() + expiresInSec * 1000;
+
+    // Use the org's stored admin_secret hash as the secret_hash for the ticket
+    // This allows rotation invalidation: when admin_secret changes, the hash
+    // won't match new tickets' secret_hash
+    const secretHash = org.admin_secret;
+
+    const isReusable = reusable === true;
+    const ticket = db.createOrgTicket(orgId, secretHash, {
+      reusable: isReusable,
+      expiresAt,
+      createdBy: req.agent!.id,
+    });
+
+    res.json({
+      ticket: ticket.id,
+      expires_at: ticket.expires_at,
+      reusable: ticket.reusable,
+    });
+  });
+
+  /**
+   * POST /api/org/rotate-secret — Rotate the org secret (admin agents only)
+   * Auth: Agent token (admin role)
+   * Returns: { org_secret }
+   */
+  auth.post('/api/org/rotate-secret', requireAgent, requireAuthRole('admin'), (req, res) => {
+    const orgId = req.agent!.org_id;
+    const org = db.getOrgById(orgId);
+    if (!org) {
+      res.status(404).json({ error: 'Organization not found', code: 'NOT_FOUND' });
+      return;
+    }
+
+    // Generate new secret
+    const newSecret = crypto.randomBytes(24).toString('hex');
+    const newSecretHash = HubDB.hashToken(newSecret);
+
+    // Update in DB
+    db.rotateOrgSecret(orgId, newSecretHash);
+
+    // Invalidate all unredeemed org_tickets for this org
+    db.invalidateOrgTickets(orgId);
+
+    res.json({ org_secret: newSecret });
+  });
+
+  /**
+   * PATCH /api/org/agents/:agent_id/role — Update an agent's auth_role (admin agents only)
+   * Auth: Agent token (admin role)
+   * Body: { auth_role: 'admin' | 'member' }
+   * Returns: { agent_id, auth_role }
+   */
+  auth.patch('/api/org/agents/:agent_id/role', requireAgent, requireAuthRole('admin'), (req, res) => {
+    const { auth_role } = req.body;
+
+    // Validate auth_role
+    if (auth_role !== 'admin' && auth_role !== 'member') {
+      res.status(400).json({ error: "auth_role must be 'admin' or 'member'", code: 'VALIDATION_ERROR' });
+      return;
+    }
+
+    const targetAgentId = req.params.agent_id as string;
+    const targetAgent = db.getAgentById(targetAgentId);
+    if (!targetAgent) {
+      res.status(404).json({ error: 'Agent not found', code: 'NOT_FOUND' });
+      return;
+    }
+
+    // Verify same org
+    if (targetAgent.org_id !== req.agent!.org_id) {
+      res.status(404).json({ error: 'Agent not found', code: 'NOT_FOUND' });
+      return;
+    }
+
+    // Guard: admin cannot demote self (prevent lockout)
+    if (targetAgentId === req.agent!.id && auth_role === 'member') {
+      res.status(400).json({ error: 'Cannot demote yourself', code: 'SELF_DEMOTION' });
+      return;
+    }
+
+    db.setAgentAuthRole(targetAgentId, auth_role);
+
+    res.json({ agent_id: targetAgentId, auth_role });
   });
 
   // ─── WS Ticket Exchange ──────────────────────────────────

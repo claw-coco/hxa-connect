@@ -839,3 +839,434 @@ describe('Health Endpoint', () => {
     expect(res.status).toBe(200);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 2: Ticket-Based Auth, Role Enforcement
+// ═══════════════════════════════════════════════════════════════
+
+describe('Phase 2: Auth Login', () => {
+  let env: TestEnv;
+  let orgId: string;
+  let orgSecret: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg('login-org');
+    orgId = org.id;
+    orgSecret = org.admin_secret;
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('issues a ticket on valid login', async () => {
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret },
+    });
+    expect(status).toBe(200);
+    expect(body.ticket).toBeTypeOf('string');
+    expect(body.expires_at).toBeTypeOf('number');
+    expect(body.reusable).toBe(false);
+    expect(body.org.id).toBe(orgId);
+    expect(body.org.name).toBe('login-org');
+  });
+
+  it('issues a reusable ticket', async () => {
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret, reusable: true, expires_in: 3600 },
+    });
+    expect(status).toBe(200);
+    expect(body.reusable).toBe(true);
+    expect(body.expires_at).toBeGreaterThan(Date.now() + 3500 * 1000);
+  });
+
+  it('rejects wrong org_secret', async () => {
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: 'wrong-secret' },
+    });
+    expect(status).toBe(401);
+    expect(body.code).toBe('INVALID_SECRET');
+  });
+
+  it('rejects unknown org_id', async () => {
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: 'nonexistent', org_secret: orgSecret },
+    });
+    expect(status).toBe(404);
+    expect(body.code).toBe('NOT_FOUND');
+  });
+
+  it('rejects missing fields', async () => {
+    const { status: s1 } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_secret: orgSecret },
+    });
+    expect(s1).toBe(400);
+
+    const { status: s2 } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId },
+    });
+    expect(s2).toBe(400);
+  });
+});
+
+describe('Phase 2: Ticket-Based Registration', () => {
+  let env: TestEnv;
+  let orgId: string;
+  let orgSecret: string;
+  let orgKey: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg('ticket-reg-org');
+    orgId = org.id;
+    orgSecret = org.admin_secret;
+    orgKey = org.api_key;
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('first agent via ticket gets admin role', async () => {
+    // Login to get a ticket
+    const { body: loginBody } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret },
+    });
+
+    // Register via ticket
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody.ticket, name: 'first-agent' },
+    });
+    expect(status).toBe(200);
+    expect(body.agent_id).toBeTypeOf('string');
+    expect(body.token).toBeTypeOf('string');
+    expect(body.name).toBe('first-agent');
+    expect(body.auth_role).toBe('admin');
+  });
+
+  it('second agent via ticket gets member role', async () => {
+    const { body: loginBody } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret },
+    });
+
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody.ticket, name: 'second-agent' },
+    });
+    expect(status).toBe(200);
+    expect(body.auth_role).toBe('member');
+  });
+
+  it('one-time ticket cannot be reused', async () => {
+    const { body: loginBody } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret, reusable: false },
+    });
+
+    // First use — succeeds
+    const { status: s1 } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody.ticket, name: 'onetime-agent-1' },
+    });
+    expect(s1).toBe(200);
+
+    // Second use — fails
+    const { status: s2, body: b2 } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody.ticket, name: 'onetime-agent-2' },
+    });
+    expect(s2).toBe(401);
+    expect(b2.code).toBe('TICKET_CONSUMED');
+  });
+
+  it('reusable ticket can be used multiple times', async () => {
+    const { body: loginBody } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret, reusable: true },
+    });
+
+    const { status: s1 } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody.ticket, name: 'reusable-agent-1' },
+    });
+    expect(s1).toBe(200);
+
+    const { status: s2 } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody.ticket, name: 'reusable-agent-2' },
+    });
+    expect(s2).toBe(200);
+  });
+
+  it('rejects invalid ticket', async () => {
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: 'nonexistent-ticket', name: 'bad-ticket-agent' },
+    });
+    expect(status).toBe(401);
+    expect(body.code).toBe('INVALID_TICKET');
+  });
+
+  it('rejects ticket from wrong org', async () => {
+    const otherOrg = env.createOrg('other-org');
+    const { body: loginBody } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: otherOrg.id, org_secret: otherOrg.admin_secret },
+    });
+
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody.ticket, name: 'cross-org-agent' },
+    });
+    expect(status).toBe(401);
+    expect(body.code).toBe('INVALID_TICKET');
+  });
+
+  it('legacy registration with org API key still works', async () => {
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/register', {
+      token: orgKey,
+      body: { name: 'legacy-agent' },
+    });
+    expect(status).toBe(200);
+    expect(body.name).toBe('legacy-agent');
+    expect(body.token).toBeTypeOf('string');
+  });
+
+  it('rejects missing required fields in ticket registration', async () => {
+    const { body: loginBody } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret },
+    });
+
+    // Missing name
+    const { status: s1 } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody.ticket },
+    });
+    expect(s1).toBe(400);
+
+    // Missing org_id
+    const { status: s2 } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { ticket: loginBody.ticket, name: 'no-org-agent' },
+    });
+    expect(s2).toBe(400);
+  });
+});
+
+describe('Phase 2: toAgentResponse includes auth_role', () => {
+  let env: TestEnv;
+  let orgKey: string;
+  let agentToken: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg();
+    orgKey = org.api_key;
+    const { token } = await env.registerAgent(orgKey, 'role-agent');
+    agentToken = token;
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('GET /api/me includes auth_role', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/me', { token: agentToken });
+    expect(status).toBe(200);
+    expect(body.auth_role).toBeDefined();
+  });
+
+  it('GET /api/agents includes auth_role in list', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/agents', { token: orgKey });
+    expect(status).toBe(200);
+    expect(body[0].auth_role).toBeDefined();
+  });
+});
+
+describe('Phase 2: Role Enforcement & Management', () => {
+  let env: TestEnv;
+  let orgId: string;
+  let orgSecret: string;
+  let adminToken: string;
+  let adminId: string;
+  let memberToken: string;
+  let memberId: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg('role-org');
+    orgId = org.id;
+    orgSecret = org.admin_secret;
+
+    // Create admin agent (first via ticket = auto-admin)
+    const { body: loginBody } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret },
+    });
+    const { body: adminBody } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody.ticket, name: 'admin-agent' },
+    });
+    adminToken = adminBody.token;
+    adminId = adminBody.agent_id;
+
+    // Create member agent (second = member)
+    const { body: loginBody2 } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret },
+    });
+    const { body: memberBody } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody2.ticket, name: 'member-agent' },
+    });
+    memberToken = memberBody.token;
+    memberId = memberBody.agent_id;
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('admin can create tickets via /api/org/tickets', async () => {
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/org/tickets', {
+      token: adminToken,
+      body: { reusable: true, expires_in: 7200 },
+    });
+    expect(status).toBe(200);
+    expect(body.ticket).toBeTypeOf('string');
+    expect(body.reusable).toBe(true);
+    expect(body.expires_at).toBeGreaterThan(Date.now());
+  });
+
+  it('member cannot create tickets', async () => {
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/org/tickets', {
+      token: memberToken,
+      body: {},
+    });
+    expect(status).toBe(403);
+    expect(body.code).toBe('FORBIDDEN');
+  });
+
+  it('admin can promote member to admin', async () => {
+    const { status, body } = await api(env.baseUrl, 'PATCH', `/api/org/agents/${memberId}/role`, {
+      token: adminToken,
+      body: { auth_role: 'admin' },
+    });
+    expect(status).toBe(200);
+    expect(body.agent_id).toBe(memberId);
+    expect(body.auth_role).toBe('admin');
+  });
+
+  it('admin can demote other admin to member', async () => {
+    // First promote memberId to admin (may already be from previous test)
+    await api(env.baseUrl, 'PATCH', `/api/org/agents/${memberId}/role`, {
+      token: adminToken,
+      body: { auth_role: 'admin' },
+    });
+
+    // Now demote
+    const { status, body } = await api(env.baseUrl, 'PATCH', `/api/org/agents/${memberId}/role`, {
+      token: adminToken,
+      body: { auth_role: 'member' },
+    });
+    expect(status).toBe(200);
+    expect(body.auth_role).toBe('member');
+  });
+
+  it('admin cannot demote self', async () => {
+    const { status, body } = await api(env.baseUrl, 'PATCH', `/api/org/agents/${adminId}/role`, {
+      token: adminToken,
+      body: { auth_role: 'member' },
+    });
+    expect(status).toBe(400);
+    expect(body.code).toBe('SELF_DEMOTION');
+  });
+
+  it('member cannot change roles', async () => {
+    const { status } = await api(env.baseUrl, 'PATCH', `/api/org/agents/${adminId}/role`, {
+      token: memberToken,
+      body: { auth_role: 'member' },
+    });
+    expect(status).toBe(403);
+  });
+
+  it('rejects invalid auth_role value', async () => {
+    const { status } = await api(env.baseUrl, 'PATCH', `/api/org/agents/${memberId}/role`, {
+      token: adminToken,
+      body: { auth_role: 'superadmin' },
+    });
+    expect(status).toBe(400);
+  });
+});
+
+describe('Phase 2: Org Secret Rotation', () => {
+  let env: TestEnv;
+  let orgId: string;
+  let orgSecret: string;
+  let adminToken: string;
+  let memberToken: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg('rotate-org');
+    orgId = org.id;
+    orgSecret = org.admin_secret;
+
+    // Create admin agent
+    const { body: loginBody } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret },
+    });
+    const { body: adminBody } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody.ticket, name: 'rotate-admin' },
+    });
+    adminToken = adminBody.token;
+
+    // Create member agent
+    const { body: loginBody2 } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret },
+    });
+    const { body: memberBody } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: loginBody2.ticket, name: 'rotate-member' },
+    });
+    memberToken = memberBody.token;
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('admin can rotate org secret', async () => {
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/org/rotate-secret', {
+      token: adminToken,
+    });
+    expect(status).toBe(200);
+    expect(body.org_secret).toBeTypeOf('string');
+    expect(body.org_secret).toHaveLength(48); // 24 bytes hex
+  });
+
+  it('new secret works for login after rotation', async () => {
+    // Rotate
+    const { body: rotateBody } = await api(env.baseUrl, 'POST', '/api/org/rotate-secret', {
+      token: adminToken,
+    });
+    const newSecret = rotateBody.org_secret;
+
+    // Login with new secret works
+    const { status } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: newSecret },
+    });
+    expect(status).toBe(200);
+
+    // Login with old secret fails
+    const { status: s2 } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: orgSecret },
+    });
+    expect(s2).toBe(401);
+  });
+
+  it('rotation invalidates outstanding tickets', async () => {
+    // Get a new secret first
+    const { body: rotBody } = await api(env.baseUrl, 'POST', '/api/org/rotate-secret', {
+      token: adminToken,
+    });
+
+    // Login to get a ticket with current secret
+    const { body: loginBody } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: orgId, org_secret: rotBody.org_secret },
+    });
+    const ticketBeforeRotation = loginBody.ticket;
+
+    // Rotate again
+    await api(env.baseUrl, 'POST', '/api/org/rotate-secret', {
+      token: adminToken,
+    });
+
+    // Try to use the old ticket — should fail (tickets were invalidated)
+    const { status } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: orgId, ticket: ticketBeforeRotation, name: 'post-rotation-agent' },
+    });
+    expect(status).toBe(401);
+  });
+
+  it('member cannot rotate secret', async () => {
+    const { status } = await api(env.baseUrl, 'POST', '/api/org/rotate-secret', {
+      token: memberToken,
+    });
+    expect(status).toBe(403);
+  });
+});

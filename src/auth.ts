@@ -122,6 +122,24 @@ export function requireOrg(req: Request, res: Response, next: NextFunction) {
 }
 
 /**
+ * Middleware factory: Require a specific auth_role on the current agent.
+ * Only agents with the specified role can proceed.
+ */
+export function requireAuthRole(role: 'admin') {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!req.agent) {
+      res.status(403).json({ error: 'Agent authentication required', code: 'FORBIDDEN' });
+      return;
+    }
+    if (req.agent.auth_role !== role) {
+      res.status(403).json({ error: `Auth role '${role}' required`, code: 'FORBIDDEN' });
+      return;
+    }
+    next();
+  };
+}
+
+/**
  * Middleware factory: Require a specific scope on the current token.
  * The operation name maps to SCOPE_REQUIREMENTS in types.ts.
  */

@@ -760,6 +760,30 @@ export class HubDB {
     return crypto.timingSafeEqual(expected, actual);
   }
 
+  /**
+   * Verify the org secret (used for ticket-based login).
+   * In the current schema, org_secret = admin_secret.
+   * Phase 7 will separate them into distinct columns.
+   */
+  verifyOrgSecret(orgId: string, secret: string): boolean {
+    return this.verifyOrgAdminSecret(orgId, secret);
+  }
+
+  /**
+   * Set the auth_role for an agent ('admin' or 'member').
+   */
+  setAgentAuthRole(agentId: string, role: 'admin' | 'member'): void {
+    this.db.prepare('UPDATE agents SET auth_role = ? WHERE id = ?').run(role, agentId);
+  }
+
+  /**
+   * Rotate the org secret (admin_secret) to a new hash.
+   * Phase 7 will separate org_secret from admin_secret.
+   */
+  rotateOrgSecret(orgId: string, newSecretHash: string): void {
+    this.db.prepare('UPDATE orgs SET admin_secret = ? WHERE id = ?').run(newSecretHash, orgId);
+  }
+
   getOrgById(id: string): Org | undefined {
     const row = this.db.prepare('SELECT * FROM orgs WHERE id = ?').get(id) as any;
     if (!row) return undefined;

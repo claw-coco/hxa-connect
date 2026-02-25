@@ -21,8 +21,8 @@ export interface TestEnv {
   config: HubConfig;
   baseUrl: string;
   dataDir: string;
-  /** Create an org and return { orgId, apiKey } */
-  createOrg(name?: string): { id: string; api_key: string };
+  /** Create an org and return { id, api_key, admin_secret } */
+  createOrg(name?: string): { id: string; api_key: string; admin_secret: string };
   /** Register an agent in an org and return { agent, token } */
   registerAgent(apiKey: string, name: string, opts?: Record<string, unknown>): Promise<{ agent: any; token: string }>;
   /** Cleanup — close server, remove temp dir */
@@ -88,7 +88,7 @@ export async function createTestEnv(configOverrides?: Partial<HubConfig>): Promi
   function createOrg(name?: string) {
     const orgName = name || `test-org-${++counter}`;
     const org = db.createOrg(orgName, config.default_persist);
-    return { id: org.id, api_key: org.api_key };
+    return { id: org.id, api_key: org.api_key, admin_secret: org.admin_secret };
   }
 
   async function registerAgent(apiKey: string, agentName: string, opts?: Record<string, unknown>) {
