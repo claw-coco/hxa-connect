@@ -2756,7 +2756,9 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       }
       // Invalid admin secret is silently discarded — verified at WS connect time anyway
     }
-    const ticketId = issueWsTicket(token, verifiedAdminSecret);
+    // Phase 3: Include org context in the ticket for WS org binding
+    const orgId = req.agent?.org_id || req.org?.id;
+    const ticketId = issueWsTicket(token, verifiedAdminSecret, orgId);
 
     res.json({
       ticket: ticketId,

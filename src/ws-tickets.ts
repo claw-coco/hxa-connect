@@ -9,6 +9,8 @@ export interface WsTicket {
   token: string;
   /** Optional admin secret (for org-level WS connections) */
   adminSecret?: string;
+  /** Org binding for multi-org validation (Phase 3) */
+  orgId?: string;
   /** Epoch ms when this ticket expires (30s TTL) */
   expiresAt: number;
 }
@@ -32,7 +34,7 @@ function purgeExpiredTickets() {
  * Issue a one-time WS ticket for the given token.
  * Returns the ticket ID (to be used as ?ticket=xxx).
  */
-export function issueWsTicket(token: string, adminSecret?: string): string {
+export function issueWsTicket(token: string, adminSecret?: string, orgId?: string): string {
   purgeExpiredTickets();
   const ticketId = crypto.randomBytes(24).toString('hex');
   wsTicketStore.set(ticketId, {
@@ -40,6 +42,7 @@ export function issueWsTicket(token: string, adminSecret?: string): string {
     // Only store non-empty adminSecret; falsy values (empty string, undefined) are omitted.
     // ws.ts relies on this: ticketAdminSecret || url.searchParams.get('admin') uses JS falsy semantics.
     ...(adminSecret ? { adminSecret } : {}),
+    ...(orgId ? { orgId } : {}),
     expiresAt: Date.now() + WS_TICKET_TTL_MS,
   });
   return ticketId;

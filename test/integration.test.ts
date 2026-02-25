@@ -1270,3 +1270,119 @@ describe('Phase 2: Org Secret Rotation', () => {
     expect(status).toBe(403);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 3: Multi-Org Context (X-Org-Id Header & WS Ticket Org Binding)
+// ═══════════════════════════════════════════════════════════════
+
+describe('Phase 3: X-Org-Id Header Validation', () => {
+  let env: TestEnv;
+  let orgId: string;
+  let agentToken: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg();
+    orgId = org.id;
+    const { token } = await env.registerAgent(org.api_key, 'org-header-agent');
+    agentToken = token;
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('accepts X-Org-Id matching agent org', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: agentToken,
+      headers: { 'X-Org-Id': orgId },
+    });
+    expect(status).toBe(200);
+    expect(body.org_id).toBe(orgId);
+  });
+
+  it('rejects X-Org-Id not matching agent org', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: agentToken,
+      headers: { 'X-Org-Id': 'wrong-org-id-00000000' },
+    });
+    expect(status).toBe(403);
+    expect(body.code).toBe('ORG_MISMATCH');
+  });
+
+  it('works without X-Org-Id (backward compat)', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: agentToken,
+    });
+    expect(status).toBe(200);
+    expect(body.org_id).toBe(orgId);
+  });
+
+  it('rejects X-Org-Id for scoped token with wrong org', async () => {
+    // Create a scoped token
+    const { body: tokenBody } = await api(env.baseUrl, 'POST', '/api/me/tokens', {
+      token: agentToken,
+      body: { label: 'scoped-org-test', scopes: ['read'] },
+    });
+    expect(tokenBody.token).toBeTruthy();
+
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: tokenBody.token,
+      headers: { 'X-Org-Id': 'wrong-org-id-00000000' },
+    });
+    expect(status).toBe(403);
+    expect(body.code).toBe('ORG_MISMATCH');
+  });
+
+  it('accepts X-Org-Id for scoped token with correct org', async () => {
+    const { body: tokenBody } = await api(env.baseUrl, 'POST', '/api/me/tokens', {
+      token: agentToken,
+      body: { label: 'scoped-org-test-ok', scopes: ['read'] },
+    });
+
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: tokenBody.token,
+      headers: { 'X-Org-Id': orgId },
+    });
+    expect(status).toBe(200);
+    expect(body.org_id).toBe(orgId);
+  });
+});
+
+describe('Phase 3: WS Ticket Org Binding', () => {
+  let env: TestEnv;
+  let orgId: string;
+  let agentToken: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg();
+    orgId = org.id;
+    const { token } = await env.registerAgent(org.api_key, 'ws-org-agent');
+    agentToken = token;
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('ws-ticket includes org binding and WS connection succeeds', async () => {
+    // Get a ws-ticket (should include org binding)
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/ws-ticket', {
+      token: agentToken,
+    });
+    expect(status).toBe(200);
+    expect(body.ticket).toBeTruthy();
+    expect(body.expires_in).toBe(30);
+
+    // Connect via WS using the ticket
+    const wsUrl = env.baseUrl.replace('http', 'ws');
+    const ws = await new Promise<import('ws').WebSocket>((resolve, reject) => {
+      const { WebSocket } = require('ws');
+      const socket = new WebSocket(`${wsUrl}/ws?ticket=${body.ticket}`);
+      socket.on('open', () => resolve(socket));
+      socket.on('error', reject);
+      setTimeout(() => reject(new Error('WS connect timeout')), 3000);
+    });
+
+    // Connection succeeded — org binding was valid
+    expect(ws.readyState).toBe(1); // OPEN
+    ws.close();
+  });
+});

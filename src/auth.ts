@@ -52,6 +52,20 @@ export function authMiddleware(db: HubDB) {
     // Try primary agent token first
     const agent = db.getAgentByToken(token);
     if (agent) {
+      // Phase 3: Validate X-Org-Id header if present
+      const requestedOrgId = req.headers['x-org-id'] as string | undefined;
+      if (requestedOrgId) {
+        if (requestedOrgId !== agent.org_id) {
+          res.status(403).json({
+            error: 'Agent does not belong to the requested organization',
+            code: 'ORG_MISMATCH',
+          });
+          return;
+        }
+      }
+      // No X-Org-Id header — fall back to agent's DB org (single-org compat)
+      // In Phase 7 this will become a deprecation warning
+
       req.agent = agent;
       req.org = db.getOrgById(agent.org_id);
       req.authType = 'agent';
@@ -73,6 +87,18 @@ export function authMiddleware(db: HubDB) {
       }
       const scopedAgent = db.getAgentById(scopedToken.agent_id);
       if (scopedAgent) {
+        // Phase 3: Validate X-Org-Id header if present
+        const requestedOrgId = req.headers['x-org-id'] as string | undefined;
+        if (requestedOrgId) {
+          if (requestedOrgId !== scopedAgent.org_id) {
+            res.status(403).json({
+              error: 'Agent does not belong to the requested organization',
+              code: 'ORG_MISMATCH',
+            });
+            return;
+          }
+        }
+
         req.agent = scopedAgent;
         req.org = db.getOrgById(scopedAgent.org_id);
         req.authType = 'agent';

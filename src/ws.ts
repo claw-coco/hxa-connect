@@ -4,7 +4,7 @@ import type { HubDB } from './db.js';
 import type { WebhookManager } from './webhook.js';
 import { validateParts, type HubConfig, type Message, type MessagePart, type WireMessage, type WsServerEvent } from './types.js';
 import { URL } from 'node:url';
-import { redeemWsTicket } from './ws-tickets.js';
+import { redeemWsTicket, type WsTicket } from './ws-tickets.js';
 import { wsLogger } from './logger.js';
 
 interface WsClient {
@@ -74,16 +74,17 @@ export class HubWS {
       let token: string | null = null;
 
       let ticketAdminSecret: string | undefined;
+      let redeemedTicket: WsTicket | undefined;
 
       if (ticketParam) {
         // Preferred: one-time ticket exchange
-        const ticket = redeemWsTicket(ticketParam);
-        if (!ticket) {
+        redeemedTicket = redeemWsTicket(ticketParam);
+        if (!redeemedTicket) {
           ws.close(4001, 'Invalid or expired ticket');
           return;
         }
-        token = ticket.token;
-        ticketAdminSecret = ticket.adminSecret;
+        token = redeemedTicket.token;
+        ticketAdminSecret = redeemedTicket.adminSecret;
       } else if (tokenParam) {
         // Backward compat: direct token in URL (deprecated — logs a warning)
         wsLogger.warn('Deprecation: WS connection using ?token= in URL. Use POST /api/ws-ticket instead.');
@@ -96,6 +97,12 @@ export class HubWS {
       // Authenticate as agent via primary token
       const agent = db.getAgentByToken(token);
       if (agent) {
+        // Phase 3: Validate org binding if ticket specifies an orgId
+        if (redeemedTicket?.orgId && redeemedTicket.orgId !== agent.org_id) {
+          ws.close(4003, 'Agent does not belong to ticket org');
+          return;
+        }
+
         const client: WsClient = {
           ws,
           agentId: agent.id,
@@ -133,6 +140,12 @@ export class HubWS {
         }
         const scopedAgent = db.getAgentById(scopedToken.agent_id);
         if (scopedAgent) {
+          // Phase 3: Validate org binding if ticket specifies an orgId
+          if (redeemedTicket?.orgId && redeemedTicket.orgId !== scopedAgent.org_id) {
+            ws.close(4003, 'Agent does not belong to ticket org');
+            return;
+          }
+
           const client: WsClient = {
             ws,
             agentId: scopedAgent.id,
@@ -168,6 +181,12 @@ export class HubWS {
       // Try org key + org admin secret (for web UI / human admins)
       const org = db.getOrgByKey(token);
       if (org) {
+        // Phase 3: Validate org binding if ticket specifies an orgId
+        if (redeemedTicket?.orgId && redeemedTicket.orgId !== org.id) {
+          ws.close(4003, 'Token does not belong to ticket org');
+          return;
+        }
+
         // Require org-scoped admin secret (from ticket or deprecated URL param)
         const adminUrlParam = url.searchParams.get('admin');
         if (adminUrlParam && !ticketAdminSecret) {
