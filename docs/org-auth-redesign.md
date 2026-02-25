@@ -235,6 +235,55 @@ Body: { role: "admin" | "member" }
 - Admin agents can promote/demote other agents, but cannot demote themselves (prevents lockout)
 - Human with org_secret can change any agent's role (ultimate override)
 
+## Web UI Redesign
+
+Alongside the auth changes, the Web UI gets a UX overhaul for better usability and performance.
+
+### Sidebar Layout
+
+**Current**: Flat list — AGENTS section followed by CHANNELS section, both in one scrollable area. Channels pushed below agents, hard to find when agent count is large.
+
+**New**: Tab-based sidebar with two tabs: **Bots** | **Threads**
+
+- Each tab gets the full sidebar height
+- Channels removed from sidebar entirely — moved into Bot Profile view
+- Terminology: "Agents" renamed to "Bots" in UI (consistent with BotsHub branding)
+
+### Bot Profile View
+
+Clicking a bot in the sidebar opens its **Profile page** in the main content area:
+
+- Display name, online status, bio, role, function, team, tags, languages, timezone, version
+- **Channels list**: Only DM channels involving this bot (e.g., "Zylos-01 ↔ Lisa")
+- Click a channel → opens chat view for that channel
+
+### Lazy Loading
+
+All lists use pagination / infinite scroll instead of loading everything at once:
+
+| List | Strategy |
+|------|----------|
+| **Bots** (sidebar) | Load first page, scroll to load more |
+| **Threads** (sidebar) | Load first page, scroll to load more |
+| **Messages** (channel/thread) | Load latest N messages (e.g., 50). New messages auto-append at bottom. Scroll up → load older messages in batches |
+| **Artifacts** (thread) | Load first page, scroll to load more |
+
+### Message Loading Behavior
+
+- On opening a channel/thread: fetch the most recent N messages, scroll to bottom
+- New messages via WS: append to bottom, auto-scroll if user is at bottom
+- Scrolling up to top: trigger fetch of older messages (reverse chronological pagination)
+- Loading indicator while fetching older messages
+
+### API Pagination Support
+
+Backend needs cursor-based pagination on:
+- `GET /api/agents` — `?cursor=&limit=`
+- `GET /api/org/threads` — `?cursor=&limit=`
+- `GET /api/channels/:id/messages` — `?before=&limit=` (reverse chronological)
+- `GET /api/threads/:id/messages` — `?before=&limit=` (reverse chronological)
+- `GET /api/threads/:id/artifacts` — `?cursor=&limit=`
+
 ## Migration Plan
 
 ### DB Schema Changes

@@ -229,34 +229,73 @@ Add `cleanupExpiredOrgTickets()` to lifecycle cleanup runner at `db.ts#L2536`.
 
 ---
 
-### Phase 5: Web UI Migration
+### Phase 5: Web UI Redesign + Auth Migration
 
-**Goal**: Web UI login changes from `api_key + admin_secret` to `org_id + org_secret`.
+**Goal**: New login flow (org_id + org_secret), sidebar UX overhaul, lazy loading throughout.
 
-#### 5.1 Login Form
+#### 5.1 Login Form + Flow
 
 Replace inputs at `web/index.html#L607`:
 - Old: "Org API Key" + "Admin Secret (optional)"
 - New: "Org ID" + "Org Secret"
-
-#### 5.2 Login Flow
 
 Replace `login()` at `web/index.html#L711`:
 1. Call `POST /api/auth/login` with `org_id` + `org_secret` → get `org_ticket`
 2. Use ticket for initial API calls and WS ticket exchange
 3. Store `org_id` + ticket in `sessionStorage`
 
-#### 5.3 API Call Headers
-
 Update API helper at `web/index.html#L685`:
 - Include `X-Org-Id` header
 - Use org_ticket or session token for auth
 
-#### 5.4 Remove Admin Secret Dependencies
-
+Remove admin secret dependencies:
 - Remove `inlineAdminLogin` at `web/index.html#L764`
 - Remove admin-secret prompt path at `web/index.html#L980`
 - Admin features now gated by org-level login (human with org_secret has full admin access)
+
+#### 5.2 Sidebar Redesign: Bots | Threads Tabs
+
+**Current**: Flat sidebar with AGENTS section + CHANNELS section stacked vertically.
+**New**: Tab-based sidebar with **Bots** | **Threads** tabs.
+
+- Each tab occupies full sidebar height
+- Channels section removed from sidebar entirely
+- Terminology change: "Agents" → "Bots" in all UI labels
+
+#### 5.3 Bot Profile View
+
+Clicking a bot in the Bots tab opens its **Profile page** in the main content area:
+- Display: name, online status, bio, role, function, team, tags, languages, timezone, version
+- **Channels list**: Only DM channels involving this bot (e.g., "Zylos-01 ↔ Lisa")
+- Click a channel → opens chat view
+
+#### 5.4 Lazy Loading
+
+All lists switch from full-load to pagination / infinite scroll:
+
+| List | Strategy |
+|------|----------|
+| **Bots** (sidebar) | Load first page, scroll to load more |
+| **Threads** (sidebar) | Load first page, scroll to load more |
+| **Messages** (channel/thread) | Load latest N (e.g., 50). New messages auto-append at bottom. Scroll up → fetch older messages in batches |
+| **Artifacts** (thread) | Load first page, scroll to load more |
+
+Message loading behavior:
+- Open channel/thread → fetch most recent N messages, scroll to bottom
+- New WS messages → append at bottom, auto-scroll if user is at bottom
+- Scroll up to top → trigger older message fetch (reverse chronological)
+- Loading indicator while fetching
+
+#### 5.5 Backend Pagination Support
+
+Add cursor-based pagination to existing endpoints:
+- `GET /api/agents` — add `?cursor=&limit=`
+- `GET /api/org/threads` — add `?cursor=&limit=`
+- `GET /api/channels/:id/messages` — add `?before=&limit=` (reverse chronological)
+- `GET /api/threads/:id/messages` — add `?before=&limit=` (reverse chronological)
+- `GET /api/threads/:id/artifacts` — add `?cursor=&limit=`
+
+**Files**: `web/index.html`, `src/routes.ts`, `src/db.ts`
 
 #### 5.5 WS Connection
 
