@@ -10,6 +10,9 @@ export type MessagePart =
 
 // ─── Core Entities ───────────────────────────────────────────
 
+export type OrgStatus = 'active' | 'suspended' | 'destroyed';
+export type AuthRole = 'admin' | 'member';
+
 export interface Org {
   id: string;
   name: string;
@@ -21,6 +24,7 @@ export interface Org {
    * compatibility, but toggling it to false has no effect on message storage.
    */
   persist_messages: boolean;
+  status: OrgStatus;
   created_at: number;
 }
 
@@ -45,8 +49,20 @@ export interface Agent {
   active_hours: string | null;
   version: string;
   runtime: string | null;
+  auth_role: AuthRole;
   online: boolean;
   last_seen_at: number | null;
+  created_at: number;
+}
+
+export interface OrgTicket {
+  id: string;
+  org_id: string;
+  secret_hash: string;
+  reusable: boolean;
+  expires_at: number;
+  consumed: boolean;
+  created_by: string | null;
   created_at: number;
 }
 

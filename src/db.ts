@@ -27,6 +27,7 @@ import type {
   AgentToken,
   TokenScope,
   ThreadPermissionPolicy,
+  OrgTicket,
 } from './types.js';
 
 // ─── Database Layer ──────────────────────────────────────────
@@ -328,6 +329,36 @@ export class HubDB {
     this.runMigration('010_hash_org_keys', () => {
       this.migrateHashOrgKeys();
     });
+
+    // Migration: add status column to orgs (Phase 1 – org auth redesign)
+    this.runMigration('011_add_org_status', () => {
+      try { this.db.exec(`ALTER TABLE orgs ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`); } catch { /* exists */ }
+    });
+
+    // Migration: add auth_role column to agents (Phase 1 – org auth redesign)
+    this.runMigration('012_add_agent_auth_role', () => {
+      try { this.db.exec(`ALTER TABLE agents ADD COLUMN auth_role TEXT NOT NULL DEFAULT 'member'`); } catch { /* exists */ }
+      // Backfill: all existing agents were implicitly admin
+      this.db.prepare(`UPDATE agents SET auth_role = 'admin'`).run();
+    });
+
+    // Migration: create org_tickets table (Phase 1 – org auth redesign)
+    this.runMigration('013_create_org_tickets', () => {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS org_tickets (
+          id TEXT PRIMARY KEY,
+          org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+          secret_hash TEXT NOT NULL,
+          reusable INTEGER NOT NULL DEFAULT 0,
+          expires_at INTEGER NOT NULL,
+          consumed INTEGER NOT NULL DEFAULT 0,
+          created_by TEXT,
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_org_tickets_org ON org_tickets(org_id);
+        CREATE INDEX IF NOT EXISTS idx_org_tickets_expires ON org_tickets(expires_at);
+      `);
+    });
   }
 
   /**
@@ -551,6 +582,7 @@ export class HubDB {
     return {
       ...row,
       persist_messages: !!row.persist_messages,
+      status: row.status ?? 'active',
     };
   }
 
@@ -569,6 +601,7 @@ export class HubDB {
       active_hours: row.active_hours ?? null,
       version: row.version ?? '1.0.0',
       runtime: row.runtime ?? null,
+      auth_role: row.auth_role ?? 'member',
       online: !!row.online,
     };
   }
@@ -698,6 +731,7 @@ export class HubDB {
       api_key: plaintextApiKey,
       admin_secret: plaintextAdminSecret,
       persist_messages: persistMessages,
+      status: 'active',
       created_at: Date.now(),
     };
     const apiKeyHash = HubDB.hashToken(plaintextApiKey);
@@ -734,6 +768,70 @@ export class HubDB {
 
   listOrgs(): Org[] {
     return (this.db.prepare('SELECT * FROM orgs ORDER BY created_at').all() as any[]).map(r => this.rowToOrg(r));
+  }
+
+  // ─── Org Ticket Operations ─────────────────────────────
+
+  private rowToOrgTicket(row: any): OrgTicket {
+    return {
+      ...row,
+      reusable: !!row.reusable,
+      consumed: !!row.consumed,
+      created_by: row.created_by ?? null,
+    };
+  }
+
+  createOrgTicket(orgId: string, secretHash: string, options: {
+    reusable?: boolean;
+    expiresAt: number;
+    createdBy?: string;
+  }): OrgTicket {
+    const ticket: OrgTicket = {
+      id: crypto.randomUUID(),
+      org_id: orgId,
+      secret_hash: secretHash,
+      reusable: options.reusable ?? false,
+      expires_at: options.expiresAt,
+      consumed: false,
+      created_by: options.createdBy ?? null,
+      created_at: Date.now(),
+    };
+    this.db.prepare(
+      'INSERT INTO org_tickets (id, org_id, secret_hash, reusable, expires_at, consumed, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(ticket.id, ticket.org_id, ticket.secret_hash, ticket.reusable ? 1 : 0, ticket.expires_at, 0, ticket.created_by, ticket.created_at);
+    return ticket;
+  }
+
+  redeemOrgTicket(ticketId: string): OrgTicket | undefined {
+    const row = this.db.prepare(
+      'SELECT * FROM org_tickets WHERE id = ? AND consumed = 0 AND expires_at > ?'
+    ).get(ticketId, Date.now()) as any;
+    if (!row) return undefined;
+    const result = this.db.prepare(
+      'UPDATE org_tickets SET consumed = 1 WHERE id = ? AND consumed = 0'
+    ).run(ticketId);
+    if (result.changes === 0) return undefined; // race condition: another consumer got it
+    return this.rowToOrgTicket({ ...row, consumed: 1 });
+  }
+
+  getOrgTicket(ticketId: string): OrgTicket | undefined {
+    const row = this.db.prepare('SELECT * FROM org_tickets WHERE id = ?').get(ticketId) as any;
+    if (!row) return undefined;
+    return this.rowToOrgTicket(row);
+  }
+
+  invalidateOrgTickets(orgId: string): number {
+    const result = this.db.prepare(
+      'DELETE FROM org_tickets WHERE org_id = ? AND consumed = 0'
+    ).run(orgId);
+    return result.changes;
+  }
+
+  cleanupExpiredOrgTickets(): number {
+    const result = this.db.prepare(
+      'DELETE FROM org_tickets WHERE expires_at <= ?'
+    ).run(Date.now());
+    return result.changes;
   }
 
   // ─── Token Hashing Utilities ─────────────────────────────
@@ -870,6 +968,7 @@ export class HubDB {
       active_hours: serializedProfile.active_hours ?? null,
       version: serializedProfile.version ?? '1.0.0',
       runtime: serializedProfile.runtime ?? null,
+      auth_role: 'member',
       online: true,
       last_seen_at: now,
       created_at: now,
@@ -881,8 +980,8 @@ export class HubDB {
       `INSERT INTO agents (
         id, org_id, name, display_name, token, metadata, webhook_url, webhook_secret,
         bio, role, "function", team, tags, languages, protocols, status_text, timezone, active_hours, version, runtime,
-        online, last_seen_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        auth_role, online, last_seen_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       agent.id,
       agent.org_id,
@@ -904,6 +1003,7 @@ export class HubDB {
       agent.active_hours,
       agent.version,
       agent.runtime,
+      agent.auth_role,
       agent.online ? 1 : 0,
       agent.last_seen_at,
       agent.created_at,
@@ -2564,6 +2664,7 @@ export class HubDB {
     this.drainBatch((bs) => this.cleanupOldAuditLog(90, bs), 5000);
     this.drainBatch((bs) => this.cleanupOldRateLimitEvents(bs), 10000);
     this.drainBatch((bs) => this.cleanupExpiredTokens(bs), 1000);
+    this.cleanupExpiredOrgTickets();
   }
 
   /** O1: Lightweight DB health check */
