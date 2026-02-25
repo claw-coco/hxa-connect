@@ -1142,6 +1142,21 @@ export class HubDB {
     ).all(orgId) as any[]).map(r => this.rowToAgent(r));
   }
 
+  /**
+   * Paginated agent list. Cursor is an agent id; results ordered by id ASC.
+   * Returns limit+1 rows so the caller can detect has_more.
+   */
+  listAgentsPaginated(orgId: string, cursor: string | undefined, limit: number): Agent[] {
+    if (cursor) {
+      return (this.db.prepare(
+        'SELECT * FROM agents WHERE org_id = ? AND id > ? ORDER BY id ASC LIMIT ?'
+      ).all(orgId, cursor, limit + 1) as any[]).map(r => this.rowToAgent(r));
+    }
+    return (this.db.prepare(
+      'SELECT * FROM agents WHERE org_id = ? ORDER BY id ASC LIMIT ?'
+    ).all(orgId, limit + 1) as any[]).map(r => this.rowToAgent(r));
+  }
+
   listBots(orgId: string, filters?: ListBotsFilters): Agent[] {
     const where: string[] = ['org_id = ?'];
     const params: any[] = [orgId];
@@ -1529,6 +1544,32 @@ export class HubDB {
     ).all(...params) as Message[];
   }
 
+  /**
+   * Paginated channel messages (newest first). `before` is a message id.
+   * Returns limit+1 rows so the caller can detect has_more.
+   */
+  getMessagesPaginated(channelId: string, before: string | undefined, limit: number): Message[] {
+    if (before) {
+      // Get the created_at of the cursor message so we can seek efficiently
+      const cursorRow = this.db.prepare(
+        'SELECT created_at FROM messages WHERE id = ?'
+      ).get(before) as { created_at: number } | undefined;
+      if (!cursorRow) {
+        // Unknown cursor — return from newest
+        return this.db.prepare(
+          'SELECT * FROM messages WHERE channel_id = ? ORDER BY created_at DESC LIMIT ?'
+        ).all(channelId, limit + 1) as Message[];
+      }
+      // Use (created_at, id) for stable ordering when timestamps collide
+      return this.db.prepare(
+        `SELECT * FROM messages WHERE channel_id = ? AND (created_at < ? OR (created_at = ? AND id < ?)) ORDER BY created_at DESC, id DESC LIMIT ?`
+      ).all(channelId, cursorRow.created_at, cursorRow.created_at, before, limit + 1) as Message[];
+    }
+    return this.db.prepare(
+      'SELECT * FROM messages WHERE channel_id = ? ORDER BY created_at DESC LIMIT ?'
+    ).all(channelId, limit + 1) as Message[];
+  }
+
   getNewMessages(agentId: string, since: number): (Message & { channel_name?: string })[] {
     return this.db.prepare(`
       SELECT m.*, ch.name as channel_name FROM messages m
@@ -1650,6 +1691,24 @@ export class HubDB {
     const rows = status
       ? (this.db.prepare(query).all(orgId, status, limit, offset) as any[])
       : (this.db.prepare(query).all(orgId, limit, offset) as any[]);
+    return rows.map(row => this.rowToThread(row));
+  }
+
+  /**
+   * Paginated thread list for org. Cursor is a thread id; ordered by id ASC.
+   * Returns limit+1 rows so the caller can detect has_more.
+   */
+  listThreadsForOrgPaginated(orgId: string, status: ThreadStatus | undefined, cursor: string | undefined, limit: number): Thread[] {
+    const conditions = ['org_id = ?'];
+    const params: any[] = [orgId];
+
+    if (status) { conditions.push('status = ?'); params.push(status); }
+    if (cursor) { conditions.push('id > ?'); params.push(cursor); }
+
+    params.push(limit + 1);
+    const rows = this.db.prepare(
+      `SELECT * FROM threads WHERE ${conditions.join(' AND ')} ORDER BY id ASC LIMIT ?`
+    ).all(...params) as any[];
     return rows.map(row => this.rowToThread(row));
   }
 
@@ -1892,6 +1951,29 @@ export class HubDB {
     return rows.map(row => this.rowToThreadMessage(row));
   }
 
+  /**
+   * Paginated thread messages (newest first). `before` is a message id.
+   * Returns limit+1 rows so the caller can detect has_more.
+   */
+  getThreadMessagesPaginated(threadId: string, before: string | undefined, limit: number): ThreadMessage[] {
+    if (before) {
+      const cursorRow = this.db.prepare(
+        'SELECT created_at FROM thread_messages WHERE id = ?'
+      ).get(before) as { created_at: number } | undefined;
+      if (!cursorRow) {
+        return (this.db.prepare(
+          'SELECT * FROM thread_messages WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?'
+        ).all(threadId, limit + 1) as any[]).map(row => this.rowToThreadMessage(row));
+      }
+      return (this.db.prepare(
+        `SELECT * FROM thread_messages WHERE thread_id = ? AND (created_at < ? OR (created_at = ? AND id < ?)) ORDER BY created_at DESC, id DESC LIMIT ?`
+      ).all(threadId, cursorRow.created_at, cursorRow.created_at, before, limit + 1) as any[]).map(row => this.rowToThreadMessage(row));
+    }
+    return (this.db.prepare(
+      'SELECT * FROM thread_messages WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?'
+    ).all(threadId, limit + 1) as any[]).map(row => this.rowToThreadMessage(row));
+  }
+
   addArtifact(
     threadId: string,
     contributorId: string,
@@ -2084,6 +2166,31 @@ export class HubDB {
       WHERE a.thread_id = ?
       ORDER BY a.created_at ASC
     `).all(threadId, threadId) as any[];
+
+    return rows.map(row => this.rowToArtifact(row));
+  }
+
+  /**
+   * Paginated artifact list (latest version per key). Cursor is an artifact_key.
+   * Returns limit+1 rows so the caller can detect has_more.
+   */
+  listArtifactsPaginated(threadId: string, cursor: string | undefined, limit: number): Artifact[] {
+    const cursorClause = cursor ? 'AND a.artifact_key > ?' : '';
+    const params: any[] = cursor
+      ? [threadId, threadId, cursor, limit + 1]
+      : [threadId, threadId, limit + 1];
+    const rows = this.db.prepare(`
+      SELECT a.* FROM artifacts a
+      JOIN (
+        SELECT artifact_key, MAX(version) as max_version
+        FROM artifacts
+        WHERE thread_id = ?
+        GROUP BY artifact_key
+      ) latest ON a.artifact_key = latest.artifact_key AND a.version = latest.max_version
+      WHERE a.thread_id = ? ${cursorClause}
+      ORDER BY a.artifact_key ASC
+      LIMIT ?
+    `).all(...params) as any[];
 
     return rows.map(row => this.rowToArtifact(row));
   }

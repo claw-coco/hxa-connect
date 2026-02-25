@@ -759,19 +759,46 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
   /**
    * GET /api/org — Get current org info
-   * Auth: Org API Key
+   * Auth: Agent token or Org API Key
    */
-  auth.get('/api/org', requireOrg, (req, res) => {
-    const org = req.org!;
-    res.json({ id: org.id, name: org.name });
+  auth.get('/api/org', (req, res) => {
+    const orgId = requireOrgOrAgent(req, res);
+    if (!orgId) return;
+    const org = db.getOrgById(orgId);
+    if (!org) {
+      res.status(404).json({ error: 'Organization not found', code: 'NOT_FOUND' });
+      return;
+    }
+    res.json({ id: org.id, name: org.name, status: org.status });
   });
 
   /**
    * GET /api/agents — List agents in the org
+   * Query: cursor? (agent id), limit? (default 50, max 200)
    */
   auth.get('/api/agents', requireOrg, (req, res) => {
-    const agents = db.listAgents(req.org!.id);
-    res.json(agents.map(a => toAgentResponse(a)));
+    const cursor = getQueryString(req.query.cursor);
+    const limitParam = getQueryString(req.query.limit);
+
+    // When no pagination params, fall back to existing unpaginated behavior
+    if (!cursor && !limitParam) {
+      const agents = db.listAgents(req.org!.id);
+      res.json(agents.map(a => toAgentResponse(a)));
+      return;
+    }
+
+    const limit = Math.min(Math.max(parseInt(limitParam || '') || 50, 1), 200);
+    const rows = db.listAgentsPaginated(req.org!.id, cursor, limit);
+    const hasMore = rows.length > limit;
+    const items = hasMore ? rows.slice(0, limit) : rows;
+    const response: Record<string, unknown> = {
+      items: items.map(a => toAgentResponse(a)),
+      has_more: hasMore,
+    };
+    if (hasMore) {
+      response.next_cursor = items[items.length - 1].id;
+    }
+    res.json(response);
   });
 
   /**
@@ -1211,7 +1238,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
   /**
    * GET /api/org/threads — List all threads in the org
-   * Query: status? (filter by thread status)
+   * Query: status?, cursor? (thread id), limit? (default 50, max 200), offset? (legacy)
    * Auth: Org API Key + X-Admin-Secret
    */
   auth.get('/api/org/threads', requireOrg, (req, res) => {
@@ -1224,9 +1251,30 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     }
 
     const status = statusRaw as ThreadStatus | undefined;
-    const limit = Math.min(Math.max(parseInt(getQueryString(req.query.limit) || '') || 50, 1), 200);
-    const offset = Math.max(parseInt(getQueryString(req.query.offset) || '') || 0, 0);
+    const cursor = getQueryString(req.query.cursor);
+    const limitParam = getQueryString(req.query.limit);
+    const offsetParam = getQueryString(req.query.offset);
 
+    // When cursor is present, use paginated behavior
+    if (cursor || (limitParam && !offsetParam)) {
+      const limit = Math.min(Math.max(parseInt(limitParam || '') || 50, 1), 200);
+      const rows = db.listThreadsForOrgPaginated(req.org!.id, status, cursor, limit);
+      const hasMore = rows.length > limit;
+      const items = hasMore ? rows.slice(0, limit) : rows;
+      const response: Record<string, unknown> = {
+        items,
+        has_more: hasMore,
+      };
+      if (hasMore) {
+        response.next_cursor = items[items.length - 1].id;
+      }
+      res.json(response);
+      return;
+    }
+
+    // Legacy offset-based behavior
+    const limit = Math.min(Math.max(parseInt(limitParam || '') || 50, 1), 200);
+    const offset = Math.max(parseInt(offsetParam || '') || 0, 0);
     const threads = db.listThreadsForOrg(req.org!.id, status, limit, offset);
     res.json(threads);
   });
@@ -1262,7 +1310,9 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
   /**
    * GET /api/org/threads/:id/messages — Thread messages (enriched with parts)
-   * Query: limit?, before?, since?
+   * Query: limit?, before? (message id for pagination, or timestamp for legacy), since?
+   * When before is a message id (not numeric), uses cursor-based pagination and returns
+   * { messages: [...], has_more: boolean } with messages sorted newest first.
    * Auth: Org API Key + X-Admin-Secret
    */
   auth.get('/api/org/threads/:id/messages', requireOrg, (req, res) => {
@@ -1276,8 +1326,28 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
     const limit = Math.min(Math.max(parseInt(getQueryString(req.query.limit) || '') || 50, 1), 200);
     const beforeStr = getQueryString(req.query.before);
-    const before = beforeStr ? parseInt(beforeStr) : undefined;
     const sinceStr = getQueryString(req.query.since);
+
+    // Detect cursor-based pagination: before is a non-numeric string (message id)
+    const isBeforeId = beforeStr !== undefined && isNaN(Number(beforeStr));
+
+    if (isBeforeId || (!beforeStr && !sinceStr && getQueryString(req.query.limit))) {
+      // Cursor-based pagination path (newest first)
+      const rows = db.getThreadMessagesPaginated(thread.id, isBeforeId ? beforeStr : undefined, limit);
+      const hasMore = rows.length > limit;
+      const messages = hasMore ? rows.slice(0, limit) : rows;
+
+      const enriched = messages.map(m => {
+        const sender = m.sender_id ? db.getAgentById(m.sender_id) : undefined;
+        return { ...enrichThreadMessage(m), sender_name: sender?.display_name || sender?.name || 'unknown' };
+      });
+
+      res.json({ messages: enriched, has_more: hasMore });
+      return;
+    }
+
+    // Legacy timestamp-based path
+    const before = beforeStr ? parseInt(beforeStr) : undefined;
     const since = sinceStr !== undefined ? parseInt(sinceStr) : undefined;
     if (since !== undefined && isNaN(since)) {
       res.status(400).json({ error: 'since must be a valid integer timestamp' });
@@ -1295,6 +1365,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
   /**
    * GET /api/org/threads/:id/artifacts — Thread artifacts
+   * Query: cursor? (artifact key), limit? (default 50, max 200)
    * Auth: Org API Key + X-Admin-Secret
    */
   auth.get('/api/org/threads/:id/artifacts', requireOrg, (req, res) => {
@@ -1306,7 +1377,27 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
 
-    res.json(db.listArtifacts(thread.id));
+    const cursor = getQueryString(req.query.cursor);
+    const limitParam = getQueryString(req.query.limit);
+
+    // When no pagination params, fall back to existing unpaginated behavior
+    if (!cursor && !limitParam) {
+      res.json(db.listArtifacts(thread.id));
+      return;
+    }
+
+    const limit = Math.min(Math.max(parseInt(limitParam || '') || 50, 1), 200);
+    const rows = db.listArtifactsPaginated(thread.id, cursor, limit);
+    const hasMore = rows.length > limit;
+    const items = hasMore ? rows.slice(0, limit) : rows;
+    const response: Record<string, unknown> = {
+      items,
+      has_more: hasMore,
+    };
+    if (hasMore) {
+      response.next_cursor = items[items.length - 1].artifact_key;
+    }
+    res.json(response);
   });
 
   // ─── Threads ─────────────────────────────────────────────
@@ -2244,7 +2335,9 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
   /**
    * GET /api/channels/:id/messages — Get messages from a channel
-   * Query: limit?, before?, since? (timestamps)
+   * Query: limit?, before? (message id for pagination, or timestamp for legacy), since? (timestamps)
+   * When before is a message id (not numeric), uses cursor-based pagination and returns
+   * { messages: [...], has_more: boolean } with messages sorted newest first.
    */
   auth.get('/api/channels/:id/messages', requireScope('read'), (req, res) => {
     const channel = db.getChannel(req.params.id as string);
@@ -2265,8 +2358,28 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
 
     const limit = Math.min(Math.max(parseInt(getQueryString(req.query.limit) || '') || 50, 1), 200);
     const beforeStr = getQueryString(req.query.before);
-    const before = beforeStr ? parseInt(beforeStr) : undefined;
     const sinceStr = getQueryString(req.query.since);
+
+    // Detect cursor-based pagination: before is a non-numeric string (message id)
+    const isBeforeId = beforeStr !== undefined && isNaN(Number(beforeStr));
+
+    if (isBeforeId || (!beforeStr && !sinceStr && getQueryString(req.query.limit))) {
+      // Cursor-based pagination path (newest first)
+      const rows = db.getMessagesPaginated(channel.id, isBeforeId ? beforeStr : undefined, limit);
+      const hasMore = rows.length > limit;
+      const messages = hasMore ? rows.slice(0, limit) : rows;
+
+      const enriched = messages.map(m => {
+        const sender = m.sender_id ? db.getAgentById(m.sender_id) : undefined;
+        return { ...enrichMessage(m), sender_name: sender?.display_name || sender?.name || 'unknown' };
+      });
+
+      res.json({ messages: enriched, has_more: hasMore });
+      return;
+    }
+
+    // Legacy timestamp-based path
+    const before = beforeStr ? parseInt(beforeStr) : undefined;
     const since = sinceStr !== undefined ? parseInt(sinceStr) : undefined;
     if (since !== undefined && isNaN(since)) {
       res.status(400).json({ error: 'since must be a valid integer timestamp' });

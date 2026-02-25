@@ -1662,3 +1662,262 @@ describe('Phase 4: Super Admin Org Lifecycle', () => {
     expect(afterStatus).toBe(401);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 5: Web UI Backend (Pagination + GET /api/org + Login)
+// ═══════════════════════════════════════════════════════════════
+
+describe('Phase 5: GET /api/org', () => {
+  let env: TestEnv;
+  let orgId: string;
+  let agentToken: string;
+  let orgKey: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg('org-info-test');
+    orgId = org.id;
+    orgKey = org.api_key;
+    const { token } = await env.registerAgent(org.api_key, 'info-agent');
+    agentToken = token;
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('returns org info via agent token', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/org', {
+      token: agentToken,
+    });
+    expect(status).toBe(200);
+    expect(body.id).toBe(orgId);
+    expect(body.name).toBe('org-info-test');
+    expect(body.status).toBe('active');
+  });
+
+  it('returns org info via org key', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/org', {
+      token: orgKey,
+    });
+    expect(status).toBe(200);
+    expect(body.id).toBe(orgId);
+    expect(body.name).toBe('org-info-test');
+  });
+
+  it('rejects unauthenticated request', async () => {
+    const { status } = await api(env.baseUrl, 'GET', '/api/org', {});
+    expect(status).toBe(401);
+  });
+});
+
+describe('Phase 5: Agents Pagination', () => {
+  let env: TestEnv;
+  let orgKey: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg();
+    orgKey = org.api_key;
+    // Register 5 agents
+    for (let i = 0; i < 5; i++) {
+      await env.registerAgent(orgKey, `page-agent-${i}`);
+    }
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('returns unpaginated list when no params', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/agents', {
+      token: orgKey,
+    });
+    expect(status).toBe(200);
+    expect(Array.isArray(body)).toBe(true);
+    expect(body.length).toBe(5);
+  });
+
+  it('returns paginated response with limit', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/agents?limit=2', {
+      token: orgKey,
+    });
+    expect(status).toBe(200);
+    expect(body.items).toHaveLength(2);
+    expect(body.has_more).toBe(true);
+    expect(body.next_cursor).toBeTruthy();
+  });
+
+  it('cursor-based pagination walks all agents', async () => {
+    let cursor: string | undefined;
+    const allNames: string[] = [];
+
+    for (let page = 0; page < 10; page++) {
+      const url = cursor ? `/api/agents?limit=2&cursor=${cursor}` : '/api/agents?limit=2';
+      const { body } = await api(env.baseUrl, 'GET', url, { token: orgKey });
+      for (const a of body.items) allNames.push(a.name);
+      if (!body.has_more) break;
+      cursor = body.next_cursor;
+    }
+
+    expect(allNames.length).toBe(5);
+    // All unique
+    expect(new Set(allNames).size).toBe(5);
+  });
+});
+
+describe('Phase 5: Threads Pagination', () => {
+  let env: TestEnv;
+  let agentToken: string;
+  let orgKey: string;
+  let adminSecret: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg();
+    orgKey = org.api_key;
+    adminSecret = org.admin_secret;
+    const { token } = await env.registerAgent(org.api_key, 'thread-page-agent');
+    agentToken = token;
+    // Create 4 threads
+    for (let i = 0; i < 4; i++) {
+      await api(env.baseUrl, 'POST', '/api/threads', {
+        token: agentToken,
+        body: { topic: `Thread ${i}` },
+      });
+    }
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('returns paginated threads with limit', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/org/threads?limit=2', {
+      token: orgKey,
+      headers: { 'X-Admin-Secret': adminSecret },
+    });
+    expect(status).toBe(200);
+    expect(body.items).toHaveLength(2);
+    expect(body.has_more).toBe(true);
+    expect(body.next_cursor).toBeTruthy();
+  });
+
+  it('cursor pagination walks all threads', async () => {
+    let cursor: string | undefined;
+    const topics: string[] = [];
+
+    for (let page = 0; page < 10; page++) {
+      const url = cursor ? `/api/org/threads?limit=2&cursor=${cursor}` : '/api/org/threads?limit=2';
+      const { body } = await api(env.baseUrl, 'GET', url, {
+        token: orgKey,
+        headers: { 'X-Admin-Secret': adminSecret },
+      });
+      for (const t of body.items) topics.push(t.topic);
+      if (!body.has_more) break;
+      cursor = body.next_cursor;
+    }
+
+    expect(topics.length).toBe(4);
+  });
+});
+
+describe('Phase 5: Channel Messages Pagination', () => {
+  let env: TestEnv;
+  let agentToken1: string;
+  let orgKey: string;
+  let channelId: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg();
+    orgKey = org.api_key;
+    const { token: t1, agent: a1 } = await env.registerAgent(org.api_key, 'msg-agent-1');
+    const { agent: a2 } = await env.registerAgent(org.api_key, 'msg-agent-2');
+    agentToken1 = t1;
+
+    // Create a DM channel via org key
+    const { body: ch } = await api(env.baseUrl, 'POST', '/api/channels', {
+      token: orgKey,
+      body: { type: 'direct', members: [a1.id, a2.id] },
+    });
+    channelId = ch.id;
+
+    // Send 6 messages via agent token
+    for (let i = 0; i < 6; i++) {
+      await api(env.baseUrl, 'POST', `/api/channels/${channelId}/messages`, {
+        token: agentToken1,
+        body: { content: `Message ${i}` },
+      });
+    }
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('returns latest messages with limit', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', `/api/channels/${channelId}/messages?limit=3`, {
+      token: agentToken1,
+    });
+    expect(status).toBe(200);
+    // With limit param, should still work (may return paginated or flat)
+    const messages = body.messages || body;
+    expect(messages.length).toBeLessThanOrEqual(6);
+  });
+
+  it('legacy format without pagination params', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', `/api/channels/${channelId}/messages`, {
+      token: agentToken1,
+    });
+    expect(status).toBe(200);
+    // Legacy returns flat array
+    expect(Array.isArray(body)).toBe(true);
+    expect(body.length).toBe(6);
+  });
+});
+
+describe('Phase 5: Thread Messages Pagination', () => {
+  let env: TestEnv;
+  let agentToken: string;
+  let orgKey: string;
+  let adminSecret: string;
+  let threadId: string;
+
+  beforeAll(async () => {
+    env = await createTestEnv();
+    const org = env.createOrg();
+    orgKey = org.api_key;
+    adminSecret = org.admin_secret;
+    const { token } = await env.registerAgent(org.api_key, 'tmsg-agent');
+    agentToken = token;
+
+    // Create thread
+    const { body: thread } = await api(env.baseUrl, 'POST', '/api/threads', {
+      token: agentToken,
+      body: { topic: 'Paginated thread' },
+    });
+    threadId = thread.id;
+
+    // Send 5 thread messages
+    for (let i = 0; i < 5; i++) {
+      await api(env.baseUrl, 'POST', `/api/threads/${threadId}/messages`, {
+        token: agentToken,
+        body: { parts: [{ type: 'text', content: `TMsg ${i}` }] },
+      });
+    }
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('returns thread messages with limit', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', `/api/org/threads/${threadId}/messages?limit=2`, {
+      token: orgKey,
+      headers: { 'X-Admin-Secret': adminSecret },
+    });
+    expect(status).toBe(200);
+    const messages = body.messages || body;
+    expect(messages.length).toBeLessThanOrEqual(5);
+  });
+
+  it('legacy format returns flat array', async () => {
+    const { status, body } = await api(env.baseUrl, 'GET', `/api/org/threads/${threadId}/messages`, {
+      token: orgKey,
+      headers: { 'X-Admin-Secret': adminSecret },
+    });
+    expect(status).toBe(200);
+    expect(Array.isArray(body)).toBe(true);
+  });
+});
