@@ -1270,3 +1270,279 @@ describe('Phase 2: Org Secret Rotation', () => {
     expect(status).toBe(403);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 4: Super Admin Org Lifecycle
+// ═══════════════════════════════════════════════════════════════
+
+describe('Phase 4: Super Admin Org Lifecycle', () => {
+  const ADMIN_SECRET = 'test-super-admin-secret';
+  let env: TestEnv;
+
+  beforeAll(async () => {
+    env = await createTestEnv({ admin_secret: ADMIN_SECRET });
+  });
+
+  afterAll(() => env.cleanup());
+
+  it('POST /api/orgs returns admin_secret and status', async () => {
+    const { status, body } = await api(env.baseUrl, 'POST', '/api/orgs', {
+      token: ADMIN_SECRET,
+      body: { name: 'lifecycle-org' },
+    });
+    expect(status).toBe(200);
+    expect(body.name).toBe('lifecycle-org');
+    expect(body.status).toBe('active');
+    expect(body.admin_secret).toBeTypeOf('string');
+    expect(body.api_key).toBeTypeOf('string');
+  });
+
+  it('POST /api/orgs requires admin auth', async () => {
+    const { status } = await api(env.baseUrl, 'POST', '/api/orgs', {
+      token: 'wrong-secret',
+      body: { name: 'should-fail' },
+    });
+    expect(status).toBe(401);
+  });
+
+  it('GET /api/orgs includes status and agent_count', async () => {
+    // Create an org with an agent so we can verify agent_count
+    const org = env.createOrg('list-test-org');
+    await env.registerAgent(org.api_key, 'list-agent');
+
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/orgs', {
+      token: ADMIN_SECRET,
+    });
+    expect(status).toBe(200);
+    expect(Array.isArray(body)).toBe(true);
+    const found = body.find((o: any) => o.name === 'list-test-org');
+    expect(found).toBeDefined();
+    expect(found.status).toBe('active');
+    expect(found.agent_count).toBe(1);
+    // api_key and admin_secret should be stripped from list
+    expect(found.api_key).toBeUndefined();
+    expect(found.admin_secret).toBeUndefined();
+  });
+
+  it('PATCH /api/orgs/:id can update name', async () => {
+    const org = env.createOrg('rename-me');
+
+    const { status, body } = await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { name: 'renamed-org' },
+    });
+    expect(status).toBe(200);
+    expect(body.name).toBe('renamed-org');
+    expect(body.status).toBe('active');
+  });
+
+  it('PATCH /api/orgs/:id can suspend org', async () => {
+    const org = env.createOrg('suspend-me');
+
+    const { status, body } = await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { status: 'suspended' },
+    });
+    expect(status).toBe(200);
+    expect(body.status).toBe('suspended');
+  });
+
+  it('PATCH /api/orgs/:id can reactivate suspended org', async () => {
+    const org = env.createOrg('reactivate-me');
+
+    // Suspend
+    await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { status: 'suspended' },
+    });
+
+    // Reactivate
+    const { status, body } = await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { status: 'active' },
+    });
+    expect(status).toBe(200);
+    expect(body.status).toBe('active');
+  });
+
+  it('PATCH /api/orgs/:id rejects setting status to destroyed', async () => {
+    const org = env.createOrg('no-destroy-patch');
+
+    const { status, body } = await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { status: 'destroyed' },
+    });
+    expect(status).toBe(400);
+    expect(body.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('PATCH /api/orgs/:id rejects modifying destroyed org', async () => {
+    const org = env.createOrg('destroy-then-patch');
+
+    // Destroy via DELETE
+    await api(env.baseUrl, 'DELETE', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+    });
+
+    // Try to modify — org is gone (deleted from DB)
+    const { status } = await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { name: 'impossible' },
+    });
+    expect(status).toBe(404);
+  });
+
+  it('PATCH /api/orgs/:id returns 404 for unknown org', async () => {
+    const { status } = await api(env.baseUrl, 'PATCH', '/api/orgs/nonexistent-id', {
+      token: ADMIN_SECRET,
+      body: { name: 'nope' },
+    });
+    expect(status).toBe(404);
+  });
+
+  it('DELETE /api/orgs/:id destroys org', async () => {
+    const org = env.createOrg('destroy-me');
+
+    const { status } = await api(env.baseUrl, 'DELETE', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+    });
+    expect(status).toBe(204);
+
+    // Verify org is gone
+    const { status: listStatus, body: orgs } = await api(env.baseUrl, 'GET', '/api/orgs', {
+      token: ADMIN_SECRET,
+    });
+    expect(listStatus).toBe(200);
+    const found = orgs.find((o: any) => o.id === org.id);
+    expect(found).toBeUndefined();
+  });
+
+  it('DELETE /api/orgs/:id returns 404 for unknown org', async () => {
+    const { status } = await api(env.baseUrl, 'DELETE', '/api/orgs/nonexistent-id', {
+      token: ADMIN_SECRET,
+    });
+    expect(status).toBe(404);
+  });
+
+  it('suspended org rejects authenticated API calls', async () => {
+    const org = env.createOrg('suspend-api-test');
+    const { token: agentToken } = await env.registerAgent(org.api_key, 'test-agent');
+
+    // Verify agent can make API calls initially
+    const { status: beforeStatus } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: agentToken,
+    });
+    expect(beforeStatus).toBe(200);
+
+    // Suspend org
+    await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { status: 'suspended' },
+    });
+
+    // Agent API calls should now be rejected
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: agentToken,
+    });
+    expect(status).toBe(403);
+    expect(body.code).toBe('ORG_SUSPENDED');
+  });
+
+  it('reactivated org allows API calls again', async () => {
+    const org = env.createOrg('reactivate-api-test');
+    const { token: agentToken } = await env.registerAgent(org.api_key, 'test-agent');
+
+    // Suspend
+    await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { status: 'suspended' },
+    });
+
+    // Verify blocked
+    const { status: blockedStatus } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: agentToken,
+    });
+    expect(blockedStatus).toBe(403);
+
+    // Reactivate
+    await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { status: 'active' },
+    });
+
+    // API calls should work again
+    const { status } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: agentToken,
+    });
+    expect(status).toBe(200);
+  });
+
+  it('suspended org rejects org API key auth too', async () => {
+    const org = env.createOrg('suspend-orgkey-test');
+
+    // Verify org key works initially
+    const { status: beforeStatus } = await api(env.baseUrl, 'GET', '/api/agents', {
+      token: org.api_key,
+    });
+    expect(beforeStatus).toBe(200);
+
+    // Suspend
+    await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { status: 'suspended' },
+    });
+
+    // Org key should be rejected
+    const { status, body } = await api(env.baseUrl, 'GET', '/api/agents', {
+      token: org.api_key,
+    });
+    expect(status).toBe(403);
+    expect(body.code).toBe('ORG_SUSPENDED');
+  });
+
+  it('suspension invalidates outstanding org tickets', async () => {
+    const org = env.createOrg('suspend-tickets-test');
+
+    // Login to get a ticket
+    const { body: loginBody } = await api(env.baseUrl, 'POST', '/api/auth/login', {
+      body: { org_id: org.id, org_secret: org.admin_secret },
+    });
+    const ticket = loginBody.ticket;
+    expect(ticket).toBeTypeOf('string');
+
+    // Suspend the org
+    await api(env.baseUrl, 'PATCH', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+      body: { status: 'suspended' },
+    });
+
+    // Ticket should be invalidated
+    const { status } = await api(env.baseUrl, 'POST', '/api/auth/register', {
+      body: { org_id: org.id, ticket, name: 'post-suspend-agent' },
+    });
+    expect(status).toBe(401);
+  });
+
+  it('destroy cascades to agents and channels', async () => {
+    const org = env.createOrg('cascade-test');
+    const { token: agentToken } = await env.registerAgent(org.api_key, 'cascade-agent');
+
+    // Verify agent exists
+    const { status: agentStatus } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: agentToken,
+    });
+    expect(agentStatus).toBe(200);
+
+    // Destroy
+    const { status } = await api(env.baseUrl, 'DELETE', `/api/orgs/${org.id}`, {
+      token: ADMIN_SECRET,
+    });
+    expect(status).toBe(204);
+
+    // Agent token should be invalid (org and agents deleted)
+    const { status: afterStatus } = await api(env.baseUrl, 'GET', '/api/me', {
+      token: agentToken,
+    });
+    expect(afterStatus).toBe(401);
+  });
+});

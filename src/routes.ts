@@ -280,8 +280,8 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
       return;
     }
     const org = db.createOrg(name, persist_messages ?? config.default_persist);
-    const { admin_secret: _stripped, ...safeOrg } = org;
-    res.json(safeOrg);
+    // Return full org including admin_secret for super admin
+    res.json(org);
   });
 
   /**
@@ -290,8 +290,86 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
    */
   router.get('/api/orgs', (req, res) => {
     if (!requireAdmin(req, res)) return;
-    const orgs = db.listOrgs().map(({ api_key, admin_secret, ...safe }) => safe);
+    const orgs = db.listOrgs().map(({ api_key, admin_secret, ...safe }) => ({
+      ...safe,
+      agent_count: db.listAgents(safe.id).length,
+    }));
     res.json(orgs);
+  });
+
+  /**
+   * PATCH /api/orgs/:org_id — Update org name or status
+   * Auth: Super admin (BOTSHUB_ADMIN_SECRET)
+   * Body: { name?: string, status?: 'active' | 'suspended' }
+   */
+  router.patch('/api/orgs/:org_id', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+
+    const org = db.getOrgById(req.params.org_id);
+    if (!org) {
+      res.status(404).json({ error: 'Organization not found', code: 'NOT_FOUND' });
+      return;
+    }
+
+    if (org.status === 'destroyed') {
+      res.status(409).json({ error: 'Cannot modify destroyed org', code: 'ORG_DESTROYED' });
+      return;
+    }
+
+    const { name, status } = req.body;
+
+    if (status !== undefined) {
+      if (status !== 'active' && status !== 'suspended') {
+        res.status(400).json({ error: 'status must be "active" or "suspended" (use DELETE to destroy)', code: 'VALIDATION_ERROR' });
+        return;
+      }
+
+      if (status !== org.status) {
+        db.updateOrgStatus(org.id, status);
+
+        if (status === 'suspended') {
+          // Invalidate all outstanding org tickets
+          db.invalidateOrgTickets(org.id);
+          // Disconnect all WS clients
+          ws.disconnectOrg(org.id, 4100, 'Organization suspended');
+        }
+      }
+    }
+
+    if (name !== undefined) {
+      if (!name || typeof name !== 'string') {
+        res.status(400).json({ error: 'name must be a non-empty string', code: 'VALIDATION_ERROR' });
+        return;
+      }
+      db.updateOrgName(org.id, name);
+    }
+
+    // Re-fetch to return current state
+    const updated = db.getOrgById(org.id)!;
+    res.json({ id: updated.id, name: updated.name, status: updated.status });
+  });
+
+  /**
+   * DELETE /api/orgs/:org_id — Destroy an org (irreversible)
+   * Auth: Super admin (BOTSHUB_ADMIN_SECRET)
+   * Response: 204 No Content
+   */
+  router.delete('/api/orgs/:org_id', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+
+    const org = db.getOrgById(req.params.org_id);
+    if (!org) {
+      res.status(404).json({ error: 'Organization not found', code: 'NOT_FOUND' });
+      return;
+    }
+
+    // Disconnect all WS clients before deletion
+    ws.disconnectOrg(org.id, 4101, 'Organization destroyed');
+
+    // Destroy org (sets status, then deletes — CASCADE handles related data)
+    db.destroyOrg(org.id);
+
+    res.status(204).end();
   });
 
   // ─── Shared Registration Validation ───────────────────────

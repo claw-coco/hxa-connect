@@ -56,6 +56,17 @@ export function authMiddleware(db: HubDB) {
       req.org = db.getOrgById(agent.org_id);
       req.authType = 'agent';
       req.tokenScopes = ['full'];
+      // Check org status
+      if (req.org) {
+        if (req.org.status === 'suspended') {
+          res.status(403).json({ error: 'Organization is suspended', code: 'ORG_SUSPENDED' });
+          return;
+        }
+        if (req.org.status === 'destroyed') {
+          res.status(403).json({ error: 'Organization is destroyed', code: 'ORG_DESTROYED' });
+          return;
+        }
+      }
       // W3: HTTP requests update last_seen but do NOT mark agent online.
       // Online status is managed exclusively by WS connections.
       db.touchAgentLastSeen(agent.id);
@@ -78,6 +89,17 @@ export function authMiddleware(db: HubDB) {
         req.authType = 'agent';
         req.tokenScopes = scopedToken.scopes;
         req.scopedTokenId = scopedToken.id;
+        // Check org status
+        if (req.org) {
+          if (req.org.status === 'suspended') {
+            res.status(403).json({ error: 'Organization is suspended', code: 'ORG_SUSPENDED' });
+            return;
+          }
+          if (req.org.status === 'destroyed') {
+            res.status(403).json({ error: 'Organization is destroyed', code: 'ORG_DESTROYED' });
+            return;
+          }
+        }
         // W3: HTTP requests update last_seen but do NOT mark agent online.
         db.touchAgentLastSeen(scopedAgent.id);
         db.touchAgentToken(scopedToken.id);
@@ -89,6 +111,15 @@ export function authMiddleware(db: HubDB) {
     // Try org API key
     const org = db.getOrgByKey(token);
     if (org) {
+      // Check org status
+      if (org.status === 'suspended') {
+        res.status(403).json({ error: 'Organization is suspended', code: 'ORG_SUSPENDED' });
+        return;
+      }
+      if (org.status === 'destroyed') {
+        res.status(403).json({ error: 'Organization is destroyed', code: 'ORG_DESTROYED' });
+        return;
+      }
       req.org = org;
       req.authType = 'org';
       next();

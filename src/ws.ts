@@ -96,6 +96,13 @@ export class HubWS {
       // Authenticate as agent via primary token
       const agent = db.getAgentByToken(token);
       if (agent) {
+        // Check org status before allowing connection
+        const agentOrg = db.getOrgById(agent.org_id);
+        if (!agentOrg || agentOrg.status !== 'active') {
+          ws.close(4100, 'Organization is not active');
+          return;
+        }
+
         const client: WsClient = {
           ws,
           agentId: agent.id,
@@ -133,6 +140,13 @@ export class HubWS {
         }
         const scopedAgent = db.getAgentById(scopedToken.agent_id);
         if (scopedAgent) {
+          // Check org status before allowing connection
+          const scopedOrg = db.getOrgById(scopedAgent.org_id);
+          if (!scopedOrg || scopedOrg.status !== 'active') {
+            ws.close(4100, 'Organization is not active');
+            return;
+          }
+
           const client: WsClient = {
             ws,
             agentId: scopedAgent.id,
@@ -168,6 +182,12 @@ export class HubWS {
       // Try org key + org admin secret (for web UI / human admins)
       const org = db.getOrgByKey(token);
       if (org) {
+        // Check org status before allowing connection
+        if (org.status !== 'active') {
+          ws.close(4100, 'Organization is not active');
+          return;
+        }
+
         // Require org-scoped admin secret (from ticket or deprecated URL param)
         const adminUrlParam = url.searchParams.get('admin');
         if (adminUrlParam && !ticketAdminSecret) {
@@ -428,6 +448,18 @@ export class HubWS {
   private send(client: WsClient, event: WsServerEvent) {
     if (client.ws.readyState === WebSocket.OPEN) {
       client.ws.send(JSON.stringify(event));
+    }
+  }
+
+  /**
+   * Disconnect all WebSocket clients belonging to a specific org.
+   * Used when org is suspended or destroyed.
+   */
+  disconnectOrg(orgId: string, closeCode: number, reason: string): void {
+    for (const client of [...this.clients]) {
+      if (client.orgId === orgId) {
+        client.ws.close(closeCode, reason);
+      }
     }
   }
 
