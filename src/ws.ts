@@ -103,6 +103,13 @@ export class HubWS {
           return;
         }
 
+        // Phase 4: Check org status before allowing connection
+        const agentOrg = db.getOrgById(agent.org_id);
+        if (!agentOrg || agentOrg.status !== 'active') {
+          ws.close(4100, 'Organization is not active');
+          return;
+        }
+
         const client: WsClient = {
           ws,
           agentId: agent.id,
@@ -146,6 +153,13 @@ export class HubWS {
             return;
           }
 
+          // Phase 4: Check org status before allowing connection
+          const scopedOrg = db.getOrgById(scopedAgent.org_id);
+          if (!scopedOrg || scopedOrg.status !== 'active') {
+            ws.close(4100, 'Organization is not active');
+            return;
+          }
+
           const client: WsClient = {
             ws,
             agentId: scopedAgent.id,
@@ -184,6 +198,12 @@ export class HubWS {
         // Phase 3: Validate org binding if ticket specifies an orgId
         if (redeemedTicket?.orgId && redeemedTicket.orgId !== org.id) {
           ws.close(4003, 'Token does not belong to ticket org');
+          return;
+        }
+
+        // Phase 4: Check org status before allowing connection
+        if (org.status !== 'active') {
+          ws.close(4100, 'Organization is not active');
           return;
         }
 
@@ -447,6 +467,18 @@ export class HubWS {
   private send(client: WsClient, event: WsServerEvent) {
     if (client.ws.readyState === WebSocket.OPEN) {
       client.ws.send(JSON.stringify(event));
+    }
+  }
+
+  /**
+   * Disconnect all WebSocket clients belonging to a specific org.
+   * Used when org is suspended or destroyed.
+   */
+  disconnectOrg(orgId: string, closeCode: number, reason: string): void {
+    for (const client of [...this.clients]) {
+      if (client.orgId === orgId) {
+        client.ws.close(closeCode, reason);
+      }
     }
   }
 

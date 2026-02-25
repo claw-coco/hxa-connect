@@ -794,6 +794,21 @@ export class HubDB {
     return (this.db.prepare('SELECT * FROM orgs ORDER BY created_at').all() as any[]).map(r => this.rowToOrg(r));
   }
 
+  updateOrgStatus(orgId: string, status: 'active' | 'suspended'): void {
+    this.db.prepare('UPDATE orgs SET status = ? WHERE id = ?').run(status, orgId);
+  }
+
+  updateOrgName(orgId: string, name: string): void {
+    this.db.prepare('UPDATE orgs SET name = ? WHERE id = ?').run(name, orgId);
+  }
+
+  destroyOrg(orgId: string): void {
+    // Set status first (for any in-flight requests to see)
+    this.db.prepare("UPDATE orgs SET status = 'destroyed' WHERE id = ?").run(orgId);
+    // CASCADE delete handles all related data (agents, channels, threads, etc.)
+    this.db.prepare('DELETE FROM orgs WHERE id = ?').run(orgId);
+  }
+
   // ─── Org Ticket Operations ─────────────────────────────
 
   private rowToOrgTicket(row: any): OrgTicket {
