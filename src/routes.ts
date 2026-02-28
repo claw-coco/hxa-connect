@@ -561,19 +561,16 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig): Router {
     }
 
     const codeHash = HubDB.hashToken(invite_code);
-    const code = db.useInviteCode(codeHash);
-    if (!code) {
-      res.status(401).json({ error: 'Invalid, expired, or exhausted invite code', code: 'INVALID_INVITE_CODE' });
+    const result = db.createOrgWithInviteCode(codeHash, name, config.default_persist);
+    if ('error' in result) {
+      res.status(401).json({ error: result.error, code: 'INVALID_INVITE_CODE' });
       return;
     }
 
-    // Create the org
-    const org = db.createOrg(name, config.default_persist);
-
     res.status(201).json({
-      org_id: org.id,
-      name: org.name,
-      org_secret: org.org_secret,
+      org_id: result.org.id,
+      name: result.org.name,
+      org_secret: result.org.org_secret,
     });
   });
 

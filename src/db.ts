@@ -652,6 +652,23 @@ export class HubDB {
     return { ...code, use_count: code.use_count + 1 };
   }
 
+  /**
+   * Atomically consume an invite code and create an org.
+   * If org creation fails, the invite code use_count is rolled back.
+   * Returns { code, org } on success, or { error } on failure.
+   */
+  createOrgWithInviteCode(codeHash: string, orgName: string, persistMessages: boolean): { code: PlatformInviteCode; org: Org } | { error: string } {
+    const txn = this.db.transaction(() => {
+      const code = this.useInviteCode(codeHash);
+      if (!code) {
+        return { error: 'Invalid, expired, or exhausted invite code' };
+      }
+      const org = this.createOrg(orgName, persistMessages);
+      return { code, org };
+    });
+    return txn();
+  }
+
   deleteInviteCode(id: string): boolean {
     const result = this.db.prepare('DELETE FROM platform_invite_codes WHERE id = ?').run(id);
     return result.changes > 0;
