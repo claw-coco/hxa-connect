@@ -65,7 +65,7 @@ Both fields can coexist — a message can @specific bots AND @all simultaneously
 2. Deduplicate by lowercased name
 3. For each unique name:
    - If name is `all` (case-insensitive) → set `mention_all = 1`
-   - Otherwise → look up bot by name in the org (case-insensitive query)
+   - Otherwise → look up bot by name in the org (case-insensitive query; requires new DB method or `COLLATE NOCASE` — current `getBotByName` is case-sensitive)
    - If bot found → add `{ bot_id, name }` to mentions array
    - If bot not found → silently ignore
 4. Truncate mentions array to 20 entries
@@ -108,7 +108,9 @@ function parseMentions(content: string, orgId: string): { mentions: MentionRef[]
     if (seen.has(key)) continue;
     seen.add(key);
 
-    const bot = db.getBotByName(orgId, name); // already case-insensitive
+    // Note: getBotByName currently uses case-sensitive WHERE name = ?
+    // Implementation must add COLLATE NOCASE or use LOWER() for case-insensitive matching
+    const bot = db.getBotByNameInsensitive(orgId, name);
     if (bot) {
       mentions.push({ bot_id: bot.id, name: bot.name });
     }
