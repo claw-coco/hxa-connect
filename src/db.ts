@@ -28,6 +28,7 @@ import type {
   TokenScope,
   ThreadPermissionPolicy,
   OrgTicket,
+  PlatformInviteCode,
 } from './types.js';
 
 // ─── Database Layer ──────────────────────────────────────────
@@ -270,6 +271,16 @@ export class HubDB {
       );
       CREATE INDEX IF NOT EXISTS idx_org_tickets_org ON org_tickets(org_id);
       CREATE INDEX IF NOT EXISTS idx_org_tickets_expires ON org_tickets(expires_at);
+
+      CREATE TABLE IF NOT EXISTS platform_invite_codes (
+        id TEXT PRIMARY KEY,
+        code_hash TEXT NOT NULL,
+        label TEXT,
+        max_uses INTEGER NOT NULL DEFAULT 0,
+        use_count INTEGER NOT NULL DEFAULT 0,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
     `);
 
     // ── Schema version tracking (for future migrations) ─────
@@ -580,6 +591,85 @@ export class HubDB {
       'DELETE FROM org_tickets WHERE expires_at <= ?'
     ).run(Date.now());
     return result.changes;
+  }
+
+  // ─── Platform Invite Codes ────────────────────────────────
+
+  private rowToInviteCode(row: any): PlatformInviteCode {
+    return {
+      id: row.id,
+      code_hash: row.code_hash,
+      label: row.label ?? null,
+      max_uses: row.max_uses,
+      use_count: row.use_count,
+      expires_at: row.expires_at,
+      created_at: row.created_at,
+    };
+  }
+
+  createInviteCode(codeHash: string, options: {
+    label?: string;
+    maxUses?: number;
+    expiresAt: number;
+  }): PlatformInviteCode {
+    const code: PlatformInviteCode = {
+      id: crypto.randomUUID(),
+      code_hash: codeHash,
+      label: options.label ?? null,
+      max_uses: options.maxUses ?? 0, // 0 = unlimited
+      use_count: 0,
+      expires_at: options.expiresAt,
+      created_at: Date.now(),
+    };
+    this.db.prepare(
+      'INSERT INTO platform_invite_codes (id, code_hash, label, max_uses, use_count, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(code.id, code.code_hash, code.label, code.max_uses, code.use_count, code.expires_at, code.created_at);
+    return code;
+  }
+
+  getInviteCodeByHash(codeHash: string): PlatformInviteCode | undefined {
+    const row = this.db.prepare(
+      'SELECT * FROM platform_invite_codes WHERE code_hash = ?'
+    ).get(codeHash) as any;
+    if (!row) return undefined;
+    return this.rowToInviteCode(row);
+  }
+
+  getInviteCodeById(id: string): PlatformInviteCode | undefined {
+    const row = this.db.prepare(
+      'SELECT * FROM platform_invite_codes WHERE id = ?'
+    ).get(id) as any;
+    if (!row) return undefined;
+    return this.rowToInviteCode(row);
+  }
+
+  listInviteCodes(): PlatformInviteCode[] {
+    return (this.db.prepare('SELECT * FROM platform_invite_codes ORDER BY created_at DESC').all() as any[])
+      .map(r => this.rowToInviteCode(r));
+  }
+
+  /**
+   * Try to consume one use of an invite code. Returns the code if successful, undefined if
+   * the code is expired, exhausted, or not found.
+   */
+  useInviteCode(codeHash: string): PlatformInviteCode | undefined {
+    const row = this.db.prepare(
+      'SELECT * FROM platform_invite_codes WHERE code_hash = ? AND expires_at > ?'
+    ).get(codeHash, Date.now()) as any;
+    if (!row) return undefined;
+    const code = this.rowToInviteCode(row);
+    // Check max_uses (0 = unlimited)
+    if (code.max_uses > 0 && code.use_count >= code.max_uses) return undefined;
+    const result = this.db.prepare(
+      'UPDATE platform_invite_codes SET use_count = use_count + 1 WHERE id = ? AND (max_uses = 0 OR use_count < max_uses)'
+    ).run(code.id);
+    if (result.changes === 0) return undefined; // race condition
+    return { ...code, use_count: code.use_count + 1 };
+  }
+
+  deleteInviteCode(id: string): boolean {
+    const result = this.db.prepare('DELETE FROM platform_invite_codes WHERE id = ?').run(id);
+    return result.changes > 0;
   }
 
   // ─── Token Hashing Utilities ─────────────────────────────
