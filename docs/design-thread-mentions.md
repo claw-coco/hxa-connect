@@ -6,7 +6,7 @@
 
 ## Summary
 
-Add @mention support for thread messages. Server parses `@name` from message content, resolves to bot IDs within the org, and stores structured mention data alongside the message. Mention scope is thread-only — channel/DM messages do not support mentions.
+Add @mention support for thread messages. Server parses `@name` from message content, resolves to bot IDs among the thread's participants, and stores structured mention data alongside the message. Mention scope is thread-only — channel/DM messages do not support mentions.
 
 ## Scope
 
@@ -65,9 +65,9 @@ Both fields can coexist — a message can @specific bots AND @all simultaneously
 2. Deduplicate by lowercased name
 3. For each unique name:
    - If name is `all` (case-insensitive) → set `mention_all = 1`
-   - Otherwise → look up bot by name in the org (case-insensitive query; requires new DB method or `COLLATE NOCASE` — current `getBotByName` is case-sensitive)
-   - If bot found → add `{ bot_id, name }` to mentions array
-   - If bot not found → silently ignore
+   - Otherwise → look up bot by name among the thread's participants (case-insensitive match). Only current thread participants can be mentioned — to involve a non-participant, invite them via the thread invite API or DM first
+   - If bot found in participants → add `{ bot_id, name }` to mentions array
+   - If bot not found in participants → silently ignore
 4. Truncate mentions array to 20 entries
 5. If mentions array is empty → store as NULL (not empty array)
 
@@ -80,7 +80,7 @@ Both fields can coexist — a message can @specific bots AND @all simultaneously
 | `@all 注意` | mention_all: 1 |
 | `@zylos0t @all 看看` | mentions: [{...zylos0t}], mention_all: 1 |
 | `email@test.com` | No match (@ preceded by `l`) |
-| `@nonexistent hi` | mentions: NULL (bot not found, ignored) |
+| `@nonexistent hi` | mentions: NULL (not a thread participant, ignored) |
 
 ## Server Implementation
 
@@ -89,11 +89,15 @@ Both fields can coexist — a message can @specific bots AND @all simultaneously
 After validating the message, before inserting into DB:
 
 ```typescript
-function parseMentions(content: string, orgId: string): { mentions: MentionRef[] | null; mentionAll: boolean } {
+function parseMentions(content: string, threadId: string): { mentions: MentionRef[] | null; mentionAll: boolean } {
   const regex = /(?<![a-zA-Z0-9_-])@([a-zA-Z0-9_-]+)/g;
   const seen = new Set<string>();
   const mentions: MentionRef[] = [];
   let mentionAll = false;
+
+  // Get thread participants for mention resolution scope
+  const participants = db.getParticipants(threadId);
+  const participantBots = participants.map(p => db.getBotById(p.bot_id)).filter(Boolean);
 
   let match;
   while ((match = regex.exec(content)) !== null) {
@@ -108,9 +112,8 @@ function parseMentions(content: string, orgId: string): { mentions: MentionRef[]
     if (seen.has(key)) continue;
     seen.add(key);
 
-    // Note: getBotByName currently uses case-sensitive WHERE name = ?
-    // Implementation must add COLLATE NOCASE or use LOWER() for case-insensitive matching
-    const bot = db.getBotByNameInsensitive(orgId, name);
+    // Resolve against thread participants only (case-insensitive)
+    const bot = participantBots.find(b => b!.name.toLowerCase() === key);
     if (bot) {
       mentions.push({ bot_id: bot.id, name: bot.name });
     }
@@ -159,7 +162,7 @@ Same as WS push — include `mentions` and `mention_all` in each message object.
 - Clients that don't understand mentions simply ignore the new fields
 - No breaking changes to existing API contracts
 
-## Type Definitions (already added)
+## Type Definitions (to be added)
 
 ```typescript
 interface MentionRef {

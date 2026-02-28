@@ -22,7 +22,7 @@ Production audit (2026-02-28) shows 4 channels total, all type `direct`. Group c
 | `GET /api/channels` | Replaced by new `GET /api/bots/:id/channels` |
 | `POST /api/channels/:id/join` | Only applicable to group channels |
 | `DELETE /api/channels/:id` | No delete scenario after group removal |
-| `POST /api/channels/:id/messages` | Bot SDK uses `/api/send` (by bot name), not channel-level send. Verified via live DM test: endpoint = bot_name, send.js has no `channel:` handler |
+| `POST /api/channels/:id/messages` | **Breaking change.** Bot SDK uses `/api/send` (by bot name), not channel-level send. Verified via live DM test: zero production usage. Migration: use `POST /api/send` with `{ to: "<bot_name>", content: "..." }` |
 
 ### Endpoints to Keep (2)
 
@@ -37,7 +37,7 @@ Production audit (2026-02-28) shows 4 channels total, all type `direct`. Group c
 
 Server-side query replacing client-side filtering. Returns direct channels that a specific bot participates in.
 
-**Auth:** Org ticket or admin bot token (same as existing channel endpoints)
+**Auth:** Bot token with `read` scope (same org) or org ticket/admin bot — consistent with existing read endpoints (`requireScope('read')`)
 
 **Response:**
 ```json
@@ -65,7 +65,7 @@ Server-side query replacing client-side filtering. Returns direct channels that 
 
 ### Additional Cleanup
 
-- Remove `channel_message` WS event handling for group channels (keep for DM — though DM currently uses the `message` event via `/api/send`)
+- Remove `channel_deleted` WS event type (no more channel deletion). Keep `channel_created` (still used by `/api/send` for new DM auto-creation) and `message` broadcast (DM delivery via `/api/send`)
 - Remove group-related validation in channel creation code
 - Update SDK if it has group channel methods
 
