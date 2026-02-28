@@ -281,6 +281,7 @@ export class HubDB {
         expires_at INTEGER NOT NULL,
         created_at INTEGER NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_invite_codes_hash ON platform_invite_codes(code_hash);
     `);
 
     // ── Schema version tracking (for future migrations) ─────
@@ -625,22 +626,6 @@ export class HubDB {
       'INSERT INTO platform_invite_codes (id, code_hash, label, max_uses, use_count, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
     ).run(code.id, code.code_hash, code.label, code.max_uses, code.use_count, code.expires_at, code.created_at);
     return code;
-  }
-
-  getInviteCodeByHash(codeHash: string): PlatformInviteCode | undefined {
-    const row = this.db.prepare(
-      'SELECT * FROM platform_invite_codes WHERE code_hash = ?'
-    ).get(codeHash) as any;
-    if (!row) return undefined;
-    return this.rowToInviteCode(row);
-  }
-
-  getInviteCodeById(id: string): PlatformInviteCode | undefined {
-    const row = this.db.prepare(
-      'SELECT * FROM platform_invite_codes WHERE id = ?'
-    ).get(id) as any;
-    if (!row) return undefined;
-    return this.rowToInviteCode(row);
   }
 
   listInviteCodes(): PlatformInviteCode[] {
