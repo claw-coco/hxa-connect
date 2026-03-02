@@ -505,20 +505,23 @@ function autoResizeTextarea(el) {
 
 async function sendThreadMessage() {
   if (!currentView || currentView.type !== 'thread') return;
+  const threadId = currentView.id;
   const input = document.getElementById('thread-input');
   const content = input.value.trim();
   if (!content) return;
 
   input.disabled = true;
   try {
-    const msg = await api('POST', `/threads/${currentView.id}/messages`, { content });
-    // Append to message list (skip if WS already delivered it)
-    const container = document.getElementById('thread-messages');
-    if (!container.querySelector(`[data-id="${msg.id}"]`)) {
-      const emptyEl = container.querySelector('.list-empty');
-      if (emptyEl) emptyEl.remove();
-      container.appendChild(createMessageEl(msg));
-      container.scrollTop = container.scrollHeight;
+    const msg = await api('POST', `/threads/${threadId}/messages`, { content });
+    // Only append if user is still viewing the same thread
+    if (currentView?.type === 'thread' && currentView.id === threadId) {
+      const container = document.getElementById('thread-messages');
+      if (!container.querySelector(`[data-id="${msg.id}"]`)) {
+        const emptyEl = container.querySelector('.list-empty');
+        if (emptyEl) emptyEl.remove();
+        container.appendChild(createMessageEl(msg));
+        container.scrollTop = container.scrollHeight;
+      }
     }
     input.value = '';
     input.style.height = 'auto';
