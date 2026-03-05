@@ -188,7 +188,7 @@ export async function handleSendThreadMessage(hub: WsHub, client: WsClient, data
     return;
   }
 
-  const { thread_id, content_type, parts, metadata } = data;
+  const { thread_id, content_type, parts, metadata, reply_to } = data;
 
   if (!thread_id || typeof thread_id !== 'string') {
     hub.sendError(client, 'thread_id is required', { ref });
@@ -259,6 +259,19 @@ export async function handleSendThreadMessage(hub: WsHub, client: WsClient, data
     }
   }
 
+  // Validate reply_to if provided
+  if (reply_to !== undefined && reply_to !== null) {
+    if (typeof reply_to !== 'string') {
+      hub.sendError(client, 'reply_to must be a string (message ID)', { ref });
+      return;
+    }
+    const parentMsg = await hub.db.getThreadMessageById(reply_to);
+    if (!parentMsg || parentMsg.thread_id !== thread.id) {
+      hub.sendError(client, 'reply_to message not found in this thread', { ref, code: 'NOT_FOUND' });
+      return;
+    }
+  }
+
   const threadParticipants = await hub.db.getParticipants(thread.id);
   const { mentions: mentionRefs, mentionAll } = await wsParseMentions(
     resolvedContent,
@@ -275,10 +288,26 @@ export async function handleSendThreadMessage(hub: WsHub, client: WsClient, data
     partsJson,
     mentionRefs ? JSON.stringify(mentionRefs) : null,
     mentionAll ? 1 : 0,
+    reply_to || null,
   );
 
   const bot = await hub.db.getBotById(client.botId!);
-  const enriched = { ...wsEnrichThreadMessage(message), sender_name: bot?.name || 'unknown' };
+  // Build reply context for broadcast
+  let reply_to_message: { id: string; sender_id: string | null; sender_name: string; content: string; created_at: number } | undefined;
+  if (message.reply_to_id) {
+    const parent = await hub.db.getThreadMessageById(message.reply_to_id);
+    if (parent) {
+      const parentBot = parent.sender_id ? await hub.db.getBotById(parent.sender_id) : undefined;
+      reply_to_message = {
+        id: parent.id,
+        sender_id: parent.sender_id,
+        sender_name: parentBot?.name || 'unknown',
+        content: parent.content.length > 200 ? parent.content.slice(0, 200) + '...' : parent.content,
+        created_at: parent.created_at,
+      };
+    }
+  }
+  const enriched = { ...wsEnrichThreadMessage(message), sender_name: bot?.name || 'unknown', ...(reply_to_message && { reply_to_message }) };
 
   await hub.db.recordAudit(thread.org_id, client.botId!, 'message.send', 'thread_message', message.id, { thread_id: thread.id, via: 'ws' });
 

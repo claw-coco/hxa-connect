@@ -2054,6 +2054,7 @@ export class HubDB {
     parts?: string | null,
     mentions?: string | null,
     mentionAll?: number,
+    replyToId?: string | null,
   ): Promise<ThreadMessage> {
     const msg: ThreadMessage = {
       id: crypto.randomUUID(),
@@ -2065,14 +2066,14 @@ export class HubDB {
       metadata: metadata ?? null,
       mentions: mentions ?? null,
       mention_all: mentionAll ?? 0,
-      reply_to_id: null,
+      reply_to_id: replyToId ?? null,
       created_at: Date.now(),
     };
 
     await this.driver.transaction(async (txn) => {
       await txn.run(`
-        INSERT INTO thread_messages (id, thread_id, sender_id, content, content_type, parts, metadata, mentions, mention_all, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO thread_messages (id, thread_id, sender_id, content, content_type, parts, metadata, mentions, mention_all, reply_to_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         msg.id,
         msg.thread_id,
@@ -2083,6 +2084,7 @@ export class HubDB {
         msg.metadata,
         msg.mentions,
         msg.mention_all,
+        msg.reply_to_id,
         msg.created_at,
       ]);
       await txn.run(`
@@ -2091,6 +2093,14 @@ export class HubDB {
     });
 
     return msg;
+  }
+
+  async getThreadMessageById(messageId: string): Promise<ThreadMessage | null> {
+    const row = await this.driver.get<any>(
+      'SELECT * FROM thread_messages WHERE id = ?',
+      [messageId],
+    );
+    return row ? this.rowToThreadMessage(row) : null;
   }
 
   async getThreadMessages(threadId: string, limit = 50, before?: number, since?: number): Promise<ThreadMessage[]> {

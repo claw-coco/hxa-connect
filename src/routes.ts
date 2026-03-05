@@ -169,6 +169,29 @@ function enrichThreadMessage(msg: ThreadMessage): WireThreadMessage {
   return { ...rest, parts: parsed, mentions, mention_all: !!msg.mention_all, metadata };
 }
 
+interface ReplyToMessage {
+  id: string;
+  sender_id: string;
+  sender_name: string;
+  content: string;
+  created_at: number;
+}
+
+/** Build a reply_to_message snippet for a ThreadMessage (1 level, truncated). */
+async function buildReplyContext(db: any, msg: ThreadMessage): Promise<ReplyToMessage | null> {
+  if (!msg.reply_to_id) return null;
+  const parent = await db.getThreadMessageById(msg.reply_to_id);
+  if (!parent) return null;
+  const sender = parent.sender_id ? await db.getBotById(parent.sender_id) : undefined;
+  return {
+    id: parent.id,
+    sender_id: parent.sender_id,
+    sender_name: sender?.name || 'unknown',
+    content: parent.content.length > 200 ? parent.content.slice(0, 200) + '...' : parent.content,
+    created_at: parent.created_at,
+  };
+}
+
 const MENTION_REGEX = /(?<![a-zA-Z0-9_-])@([a-zA-Z0-9_-]+)/g;
 const MAX_MENTIONS = 20;
 
@@ -1755,7 +1778,8 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
 
       const enriched = await Promise.all(messages.map(async (m) => {
         const sender = m.sender_id ? await db.getBotById(m.sender_id) : undefined;
-        return { ...enrichThreadMessage(m), sender_name: sender?.name || 'unknown' };
+        const reply_to_message = await buildReplyContext(db, m);
+        return { ...enrichThreadMessage(m), sender_name: sender?.name || 'unknown', ...(reply_to_message && { reply_to_message }) };
       }));
 
       res.json({ messages: enriched, has_more: hasMore });
@@ -2533,7 +2557,20 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
     const thread = await requireThreadParticipant(req, res, req.params.id as string, { rejectTerminal: true });
     if (!thread) return;
 
-    const { content, content_type, metadata, parts } = req.body;
+    const { content, content_type, metadata, parts, reply_to } = req.body;
+
+    // Validate reply_to if provided
+    if (reply_to !== undefined) {
+      if (typeof reply_to !== 'string') {
+        res.status(400).json({ error: 'reply_to must be a string (message ID)' });
+        return;
+      }
+      const parentMsg = await db.getThreadMessageById(reply_to);
+      if (!parentMsg || parentMsg.thread_id !== thread.id) {
+        res.status(400).json({ error: 'reply_to message not found in this thread', code: 'NOT_FOUND' });
+        return;
+      }
+    }
 
     // S6: content_type size limit
     if (content_type !== undefined && typeof content_type === 'string' && Buffer.byteLength(content_type, 'utf8') > FIELD_LIMITS.content_type) {
@@ -2618,9 +2655,11 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
       partsJson,
       mentionRefs ? JSON.stringify(mentionRefs) : null,
       mentionAll ? 1 : 0,
+      reply_to || null,
     );
 
-    const enriched = { ...enrichThreadMessage(message), sender_name: req.bot!.name };
+    const replyContext = await buildReplyContext(db, message);
+    const enriched = { ...enrichThreadMessage(message), sender_name: req.bot!.name, ...(replyContext && { reply_to_message: replyContext }) };
 
     // Audit (rate limit event already recorded atomically in checkMessageRateLimit)
     await db.recordAudit(thread.org_id, req.bot!.id, 'message.send', 'thread_message', message.id, { thread_id: thread.id });
@@ -2665,7 +2704,8 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
 
       const enriched = await Promise.all(messages.map(async (m) => {
         const sender = m.sender_id ? await db.getBotById(m.sender_id) : undefined;
-        return { ...enrichThreadMessage(m), sender_name: sender?.name || 'unknown' };
+        const reply_to_message = await buildReplyContext(db, m);
+        return { ...enrichThreadMessage(m), sender_name: sender?.name || 'unknown', ...(reply_to_message && { reply_to_message }) };
       }));
 
       const response: Record<string, unknown> = {
