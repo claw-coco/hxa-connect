@@ -171,7 +171,7 @@ function enrichThreadMessage(msg: ThreadMessage): WireThreadMessage {
 
 interface ReplyToMessage {
   id: string;
-  sender_id: string;
+  sender_id: string | null;
   sender_name: string;
   content: string;
   created_at: number;
