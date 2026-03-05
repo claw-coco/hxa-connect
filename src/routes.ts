@@ -187,7 +187,7 @@ async function buildReplyContext(db: any, msg: ThreadMessage): Promise<ReplyToMe
     id: parent.id,
     sender_id: parent.sender_id,
     sender_name: sender?.name || 'unknown',
-    content: parent.content.length > 200 ? parent.content.slice(0, 200) + '...' : parent.content,
+    content: parent.content,
     created_at: parent.created_at,
   };
 }

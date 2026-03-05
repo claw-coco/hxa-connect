@@ -302,7 +302,7 @@ export async function handleSendThreadMessage(hub: WsHub, client: WsClient, data
         id: parent.id,
         sender_id: parent.sender_id,
         sender_name: parentBot?.name || 'unknown',
-        content: parent.content.length > 200 ? parent.content.slice(0, 200) + '...' : parent.content,
+        content: parent.content,
         created_at: parent.created_at,
       };
     }
