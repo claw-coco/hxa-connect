@@ -58,6 +58,7 @@ export function ThreadView({ threadId, wsMessages, wsThread, wsThreadStatusChang
     setMessages([]);
     setCursor(undefined);
     setHasOlder(false);
+    setReplyTo(null);
     userScrolledUp.current = false;
 
     (async () => {

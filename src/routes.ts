@@ -178,10 +178,10 @@ interface ReplyToMessage {
 }
 
 /** Build a reply_to_message context for a ThreadMessage (1 level). */
-async function buildReplyContext(db: any, msg: ThreadMessage): Promise<ReplyToMessage | null> {
+export async function buildReplyContext(db: any, msg: ThreadMessage): Promise<ReplyToMessage | null> {
   if (!msg.reply_to_id) return null;
   const parent = await db.getThreadMessageById(msg.reply_to_id);
-  if (!parent) return null;
+  if (!parent || parent.thread_id !== msg.thread_id) return null;
   const sender = parent.sender_id ? await db.getBotById(parent.sender_id) : undefined;
   return {
     id: parent.id,

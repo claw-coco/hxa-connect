@@ -1,5 +1,6 @@
 import { validateParts } from '../types.js';
 import type { ThreadStatus, CloseReason, ArtifactType } from '../types.js';
+import { buildReplyContext } from '../routes.js';
 import type { WsClient, WsHub } from './protocol.js';
 import {
   contentFromParts,
@@ -292,22 +293,8 @@ export async function handleSendThreadMessage(hub: WsHub, client: WsClient, data
   );
 
   const bot = await hub.db.getBotById(client.botId!);
-  // Build reply context for broadcast
-  let reply_to_message: { id: string; sender_id: string | null; sender_name: string; content: string; created_at: number } | undefined;
-  if (message.reply_to_id) {
-    const parent = await hub.db.getThreadMessageById(message.reply_to_id);
-    if (parent) {
-      const parentBot = parent.sender_id ? await hub.db.getBotById(parent.sender_id) : undefined;
-      reply_to_message = {
-        id: parent.id,
-        sender_id: parent.sender_id,
-        sender_name: parentBot?.name || 'unknown',
-        content: parent.content,
-        created_at: parent.created_at,
-      };
-    }
-  }
-  const enriched = { ...wsEnrichThreadMessage(message), sender_name: bot?.name || 'unknown', ...(reply_to_message && { reply_to_message }) };
+  const replyContext = await buildReplyContext(hub.db, message);
+  const enriched = { ...wsEnrichThreadMessage(message), sender_name: bot?.name || 'unknown', ...(replyContext && { reply_to_message: replyContext }) };
 
   await hub.db.recordAudit(thread.org_id, client.botId!, 'message.send', 'thread_message', message.id, { thread_id: thread.id, via: 'ws' });
 
