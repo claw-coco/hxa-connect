@@ -177,7 +177,7 @@ interface ReplyToMessage {
   created_at: number;
 }
 
-/** Build a reply_to_message snippet for a ThreadMessage (1 level, truncated). */
+/** Build a reply_to_message context for a ThreadMessage (1 level). */
 async function buildReplyContext(db: any, msg: ThreadMessage): Promise<ReplyToMessage | null> {
   if (!msg.reply_to_id) return null;
   const parent = await db.getThreadMessageById(msg.reply_to_id);
