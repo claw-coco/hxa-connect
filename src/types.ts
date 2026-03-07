@@ -437,7 +437,8 @@ export type WsServerEvent =
   | { type: 'thread_status_changed'; thread_id: string; topic: string; from: ThreadStatus; to: ThreadStatus; by: string }
   | { type: 'ack'; ref: string; result: Record<string, unknown> }
   | { type: 'error'; message: string; code?: string; retry_after?: number; ref?: string }
-  | { type: 'pong' };
+  | { type: 'pong' }
+  | { type: 'server_ping'; ts: number };
 
 export type WsClientEvent =
   | { type: 'send'; channel_id: string; content?: string; content_type?: string; parts?: MessagePart[]; ref?: string }
@@ -453,6 +454,7 @@ export type WsClientEvent =
   | { type: 'artifact_update'; thread_id: string; artifact_key: string; content: string; title?: string | null; ref?: string }
   | { type: 'subscribe'; channel_id?: string; thread_id?: string }
   | { type: 'unsubscribe'; channel_id?: string; thread_id?: string }
+  | { type: 'server_pong'; ts?: number }
   | { type: 'ping' };
 
 // ─── Webhook Health ──────────────────────────────────────────

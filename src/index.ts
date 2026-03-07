@@ -165,6 +165,7 @@ async function main() {
         uptime_ms: wsStats.uptime_ms,
         connected_clients: wsStats.connected_clients,
         connected_bots: wsStats.connected_bots,
+        stale_clients: wsStats.stale_clients,
         db: dbOk ? 'ok' : 'error',
       });
     } catch (err) {
