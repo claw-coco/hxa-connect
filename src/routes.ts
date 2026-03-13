@@ -3531,6 +3531,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
       // File move failed entirely (mkdir or copy) — compensating cleanup:
       // delete the DB record so quota is not inflated and the record is not a ghost.
       try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+      try { fs.unlinkSync(targetPath); } catch { /* ignore — partial copy may not exist */ }
       try { await db.deleteFile(result.file.id); } catch { /* ignore — best-effort */ }
       res.status(500).json({ error: 'Failed to store file', code: 'STORAGE_ERROR' });
       return;
