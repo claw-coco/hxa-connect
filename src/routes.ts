@@ -3517,9 +3517,9 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
 
     // Move file from temp staging to hierarchical org/uploader/shard directory
     const targetDir = path.join(filesDir, orgId, uploaderId, shard);
-    fs.mkdirSync(targetDir, { recursive: true });
     const targetPath = path.join(config.data_dir, relativePath);
     try {
+      fs.mkdirSync(targetDir, { recursive: true });
       try {
         fs.renameSync(file.path, targetPath);
       } catch {
@@ -3527,10 +3527,11 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
         fs.copyFileSync(file.path, targetPath);
         try { fs.unlinkSync(file.path); } catch { /* ignore */ }
       }
-    } catch (moveErr) {
-      // File move failed entirely — clean up temp file, but DB record already exists.
-      // The file will be missing on disk; admin can re-upload or delete the DB record.
+    } catch {
+      // File move failed entirely (mkdir or copy) — compensating cleanup:
+      // delete the DB record so quota is not inflated and the record is not a ghost.
       try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+      try { await db.deleteFile(result.file.id); } catch { /* ignore — best-effort */ }
       res.status(500).json({ error: 'Failed to store file', code: 'STORAGE_ERROR' });
       return;
     }

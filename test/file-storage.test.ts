@@ -170,6 +170,37 @@ describe('Hierarchical file storage (#212)', () => {
     expect(tmpFiles).toHaveLength(0);
   });
 
+  it('move failure: no DB record left, quota unchanged', async () => {
+    // Use a fresh org with no pre-existing subdirectories so chmod on files/ blocks mkdir
+    const orgC = await env.createOrg('org-failtest');
+    const botC = await env.registerBot(orgC.org_secret, 'bot-c');
+
+    // Record quota before attempt
+    const quotaBefore = await (env.db as any).getDailyUploadBytes(orgC.id);
+
+    // Make the files directory read-only to force move failure.
+    // orgC has no subdirectory yet, so mkdirSync(files/<orgC.id>/...) will fail.
+    const filesDir = path.join(env.dataDir, 'files');
+    fs.chmodSync(filesDir, 0o555);
+    let result: { status: number; body: any };
+    try {
+      result = await uploadFile(env.baseUrl, botC.token, PNG_1x1, 'fail-test.png', 'image/png');
+    } finally {
+      fs.chmodSync(filesDir, 0o755); // always restore
+    }
+
+    expect(result!.status).toBe(500);
+    expect(result!.body.code).toBe('STORAGE_ERROR');
+
+    // Compensating cleanup: no DB record should remain
+    const quotaAfter = await (env.db as any).getDailyUploadBytes(orgC.id);
+    expect(quotaAfter).toBe(quotaBefore);
+
+    // _tmp should also be clean (temp file deleted)
+    const tmpFiles = fs.readdirSync(path.join(env.dataDir, 'files', '_tmp'));
+    expect(tmpFiles).toHaveLength(0);
+  });
+
   it('file info endpoint works with new path format', async () => {
     const upload = await uploadFile(env.baseUrl, botA.token, PNG_1x1, 'info-test.png', 'image/png');
     expect(upload.status).toBe(200);
