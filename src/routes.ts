@@ -3354,6 +3354,8 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
 
   const filesDir = path.join(config.data_dir, 'files');
   fs.mkdirSync(filesDir, { recursive: true });
+  const filesTmpDir = path.join(filesDir, '_tmp');
+  fs.mkdirSync(filesTmpDir, { recursive: true });
 
   // Single source of truth: MIME → safe disk extension. ALLOWED_MIME_TYPES is derived from this.
   const MIME_TO_EXT: Record<string, string> = {
@@ -3362,9 +3364,16 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
   };
   const ALLOWED_MIME_TYPES = new Set(Object.keys(MIME_TO_EXT));
 
+  // Defense-in-depth: reject org IDs containing path separators or traversal sequences.
+  // Org IDs are UUIDs from the DB, but validate before using in filesystem paths.
+  function safeOrgId(orgId: string): boolean {
+    return !orgId.includes('/') && !orgId.includes('\\') && !orgId.includes('..') && !orgId.includes('\0');
+  }
+
   const upload = multer({
     storage: multer.diskStorage({
-      destination: (_req, _file, cb) => cb(null, filesDir),
+      // Stage uploads in _tmp/; moved to hierarchical path after validation + quota check
+      destination: (_req, _file, cb) => cb(null, filesTmpDir),
       filename: (_req, file, cb) => {
         // Use safe extension derived from MIME (falls back to original extension for unknown types)
         const ext = MIME_TO_EXT[file.mimetype] ?? path.extname(file.originalname);
@@ -3464,7 +3473,17 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
     const originalName = Buffer.from(file.originalname, 'latin1').toString('utf8');
 
     const orgId = req.bot!.org_id;
-    const relativePath = `files/${file.filename}`;
+
+    // Validate org_id for filesystem safety before using in paths
+    if (!safeOrgId(orgId)) {
+      try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+      res.status(400).json({ error: 'Invalid org_id for storage', code: 'BAD_REQUEST' });
+      return;
+    }
+
+    // Hierarchical storage: files/<org_id>/<shard>/<filename>
+    const shard = file.filename.substring(0, 2);
+    const relativePath = `files/${orgId}/${shard}/${file.filename}`;
     const dailyLimitBytes = config.file_upload_mb_per_day * 1024 * 1024;
     const settings = await db.getOrgSettings(orgId);
     const perBotDailyLimitBytes = settings.file_upload_mb_per_day_per_bot * 1024 * 1024;
@@ -3482,7 +3501,7 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
     );
 
     if (!result.ok) {
-      // Clean up the uploaded file since we're rejecting it
+      // Clean up the staged temp file since we're rejecting it
       try { fs.unlinkSync(file.path); } catch { /* temp file may already be gone */ }
       const usedMb = Math.round(result.dailyBytes / 1024 / 1024);
       const limitMb = Math.round(result.limitBytes / 1024 / 1024);
@@ -3491,6 +3510,26 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
         error: `${scope} upload quota exceeded (${usedMb}MB / ${limitMb}MB used today)`,
         code: 'RATE_LIMITED',
       });
+      return;
+    }
+
+    // Move file from temp staging to hierarchical org/shard directory
+    const targetDir = path.join(filesDir, orgId, shard);
+    fs.mkdirSync(targetDir, { recursive: true });
+    const targetPath = path.join(config.data_dir, relativePath);
+    try {
+      try {
+        fs.renameSync(file.path, targetPath);
+      } catch {
+        // Cross-filesystem fallback: copy + delete
+        fs.copyFileSync(file.path, targetPath);
+        try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+      }
+    } catch (moveErr) {
+      // File move failed entirely — clean up temp file, but DB record already exists.
+      // The file will be missing on disk; admin can re-upload or delete the DB record.
+      try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+      res.status(500).json({ error: 'Failed to store file', code: 'STORAGE_ERROR' });
       return;
     }
 
