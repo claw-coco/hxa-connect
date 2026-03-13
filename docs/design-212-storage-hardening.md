@@ -40,24 +40,23 @@ Existing `files/{uuid}.ext` paths stored in DB `files.path` column must remain v
 ### New Storage Layout
 
 ```
-data/files/<org_id>/<shard>/<uuid>.<ext>
+data/files/<org_id>/<uploader_id>/<shard>/<uuid>.<ext>
 ```
 
 Where `<shard>` = first 2 characters of the file UUID. This provides:
 - **Level 1**: org isolation (`<org_id>/`)
 - **Level 2**: shard to avoid hot directories (`<shard>/` = 256 possible subdirs from hex chars)
 
-We intentionally omit `<uploader_id>` level because:
-1. Bots can be deleted (`ON DELETE SET NULL`), orphaning directories
-2. File access is org-scoped, not bot-scoped — adding bot dirs adds complexity with no access-control benefit
-3. The UUID shard already prevents hot directories
+Per issue requirement, includes `<uploader_id>` level for per-bot partitioning within org.
+When a bot is deleted (`ON DELETE SET NULL`), existing file paths in DB remain valid.
+Migration uses `_deleted` placeholder for null uploader_id.
 
 ### Path Format
 
 Old: `files/{uuid}.{ext}`
-New: `files/{org_id}/{shard}/{uuid}.{ext}`
+New: `files/{org_id}/{uploader_id}/{shard}/{uuid}.{ext}`
 
-Example: `files/org_abc123/a1/a1b2c3d4-5678-9abc-def0-123456789abc.jpg`
+Example: `files/org_abc123/bot_xyz789/a1/a1b2c3d4-5678-9abc-def0-123456789abc.jpg`
 
 ### Changes Required
 

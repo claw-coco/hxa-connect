@@ -38,16 +38,23 @@ const db = new Database(dbPath);
 
 // ── Detect old-format records ────────────────────────────
 // Old format: files/{uuid}.{ext} (no org_id subdirectory)
-// New format: files/{org_id}/{shard}/{uuid}.{ext}
+// Intermediate format (if upgrading from first version): files/{org_id}/{shard}/{uuid}.{ext}
+// New format: files/{org_id}/{uploader_id}/{shard}/{uuid}.{ext}
 const OLD_PATH_RE = /^files\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.\w+$/;
+
+// Defense-in-depth: reject IDs containing path separators or traversal sequences
+function safeId(id: string): boolean {
+  return !!id && !id.includes('/') && !id.includes('\\') && !id.includes('..') && !id.includes('\0');
+}
 
 interface FileRow {
   id: string;
   org_id: string;
+  uploader_id: string | null;
   path: string;
 }
 
-const rows: FileRow[] = db.prepare('SELECT id, org_id, path FROM files').all();
+const rows: FileRow[] = db.prepare('SELECT id, org_id, uploader_id, path FROM files').all();
 console.log(`Found ${rows.length} file records total.`);
 
 let migrated = 0;
@@ -62,9 +69,17 @@ for (const row of rows) {
     continue;
   }
 
+  // Validate IDs for path safety
+  if (!safeId(row.org_id)) {
+    console.error(`  SKIP: ${row.id} — unsafe org_id: ${row.org_id}`);
+    errors++;
+    continue;
+  }
+  const uploaderId = row.uploader_id && safeId(row.uploader_id) ? row.uploader_id : '_deleted';
+
   const filename = path.basename(row.path);
   const shard = filename.substring(0, 2);
-  const newRelativePath = `files/${row.org_id}/${shard}/${filename}`;
+  const newRelativePath = `files/${row.org_id}/${uploaderId}/${shard}/${filename}`;
 
   const oldDiskPath = path.join(dataDir, row.path);
   const newDiskPath = path.join(dataDir, newRelativePath);

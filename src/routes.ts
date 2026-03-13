@@ -3474,16 +3474,18 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
 
     const orgId = req.bot!.org_id;
 
-    // Validate org_id for filesystem safety before using in paths
-    if (!safeOrgId(orgId)) {
+    const uploaderId = req.bot!.id;
+
+    // Validate org_id and uploader_id for filesystem safety before using in paths
+    if (!safeOrgId(orgId) || !safeOrgId(uploaderId)) {
       try { fs.unlinkSync(file.path); } catch { /* ignore */ }
-      res.status(400).json({ error: 'Invalid org_id for storage', code: 'BAD_REQUEST' });
+      res.status(400).json({ error: 'Invalid org_id or bot_id for storage', code: 'BAD_REQUEST' });
       return;
     }
 
-    // Hierarchical storage: files/<org_id>/<shard>/<filename>
+    // Hierarchical storage: files/<org_id>/<uploader_id>/<shard>/<filename>
     const shard = file.filename.substring(0, 2);
-    const relativePath = `files/${orgId}/${shard}/${file.filename}`;
+    const relativePath = `files/${orgId}/${uploaderId}/${shard}/${file.filename}`;
     const dailyLimitBytes = config.file_upload_mb_per_day * 1024 * 1024;
     const settings = await db.getOrgSettings(orgId);
     const perBotDailyLimitBytes = settings.file_upload_mb_per_day_per_bot * 1024 * 1024;
@@ -3513,8 +3515,8 @@ export function createRouter(db: HubDB, ws: HubWS, config: HubConfig, sessionSto
       return;
     }
 
-    // Move file from temp staging to hierarchical org/shard directory
-    const targetDir = path.join(filesDir, orgId, shard);
+    // Move file from temp staging to hierarchical org/uploader/shard directory
+    const targetDir = path.join(filesDir, orgId, uploaderId, shard);
     fs.mkdirSync(targetDir, { recursive: true });
     const targetPath = path.join(config.data_dir, relativePath);
     try {

@@ -70,22 +70,23 @@ describe('Hierarchical file storage (#212)', () => {
     await env.cleanup();
   });
 
-  it('upload creates hierarchical path: files/<org_id>/<shard>/<uuid>.ext', async () => {
+  it('upload creates hierarchical path: files/<org_id>/<uploader_id>/<shard>/<uuid>.ext', async () => {
     const { status, body } = await uploadFile(env.baseUrl, botA.token, PNG_1x1, 'test.png', 'image/png');
     expect(status).toBe(200);
     expect(body.id).toBeTruthy();
     expect(body.url).toBe(`/api/files/${body.id}`);
 
-    // Verify disk path is hierarchical
+    // Verify disk path is hierarchical with uploader_id
     const record = await env.db.getFile(body.id);
     expect(record).toBeTruthy();
-    expect(record!.path).toMatch(new RegExp(`^files/${orgA.id}/[0-9a-f]{2}/`));
+    expect(record!.path).toMatch(new RegExp(`^files/${orgA.id}/.+/[0-9a-f]{2}/`));
 
-    // Verify shard is first 2 chars of filename
+    // Verify path segments: files/<org_id>/<uploader_id>/<shard>/<filename>
     const parts = record!.path.split('/');
-    expect(parts).toHaveLength(4);
-    const [, orgDir, shard, filename] = parts;
+    expect(parts).toHaveLength(5);
+    const [, orgDir, uploaderDir, shard, filename] = parts;
     expect(orgDir).toBe(orgA.id);
+    expect(uploaderDir).toBe(botA.bot.id);
     expect(shard).toBe(filename.substring(0, 2));
 
     // Verify file exists on disk
